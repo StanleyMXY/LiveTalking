@@ -49,16 +49,17 @@ def _load_sensevoice():
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         logger.info(
             f"[ASR] Loading SenseVoiceSmall on device='{device}' "
-            f"(first run will download ~500MB from ModelScope)..."
+            f"(first run will download ~500MB from HuggingFace)..."
         )
 
         t0 = time.perf_counter()
         _sensevoice_model = AutoModel(
-            model="iic/SenseVoiceSmall",
+            model="FunAudioLLM/SenseVoiceSmall",
             vad_model="fsmn-vad",
             vad_kwargs={"max_single_segment_time": 30000},
             device=device,
             trust_remote_code=True,
+            hub="hf",
         )
         elapsed = time.perf_counter() - t0
         logger.info(

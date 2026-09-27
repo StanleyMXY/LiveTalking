@@ -1,9 +1,15 @@
 import os
 import json
+import re
 import uuid
 from aiohttp import web
 from server.task_manager import task_manager
 from utils.logger import logger
+
+_SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+IMAGE_TO_VIDEO_FRAMES = 120
 
 def json_ok(data=None):
     body = {"code": 0, "msg": "ok"}
@@ -19,6 +25,23 @@ def json_error(msg: str, code: int = -1):
         content_type="application/json",
         text=json.dumps({"code": code, "msg": str(msg)}),
     )
+
+def _image_to_video(image_path: str) -> str:
+    """把一张静态图片重复写成一个短视频，供 genavatar.py 的视频输入管线复用。"""
+    import cv2
+
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"failed to read image: {image_path}")
+    h, w = img.shape[:2]
+
+    synth_path = image_path + "_synth.mp4"
+    writer = cv2.VideoWriter(synth_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
+    for _ in range(IMAGE_TO_VIDEO_FRAMES):
+        writer.write(img)
+    writer.release()
+    return synth_path
+
 
 async def create_avatar_task(request):
     """
@@ -61,6 +84,8 @@ async def create_avatar_task(request):
 
         if not model_type or not avatar_id:
             return json_error("model and avatar_id are required")
+        if not _SAFE_ID_RE.match(avatar_id):
+            return json_error("avatar_id must match ^[A-Za-z0-9_-]{1,64}$")
 
         if 'video_path' not in params:
             return json_error("video_file or video_path is required")
@@ -70,6 +95,10 @@ async def create_avatar_task(request):
         video_path = params['video_path']
         if not os.path.isabs(video_path):
             video_path = os.path.join(data_path, video_path)
+
+        ext = os.path.splitext(video_path)[1].lower()
+        if ext in IMAGE_EXTS:
+            video_path = _image_to_video(video_path)
 
         save_path = data_path
 
@@ -129,8 +158,26 @@ async def delete_avatar_task(request):
         return json_error(msg)
     return json_ok(data={"msg": msg})
 
+async def list_avatars(request):
+    """
+    GET /api/avatar/list — 扫描 data/avatars/ 下已经准备好的形象（含 coords.pkl 的目录）
+    """
+    data_path = os.path.abspath('./data/avatars')
+    avatars = []
+    if os.path.isdir(data_path):
+        for name in sorted(os.listdir(data_path)):
+            avatar_dir = os.path.join(data_path, name)
+            coords_path = os.path.join(avatar_dir, 'coords.pkl')
+            if os.path.isdir(avatar_dir) and os.path.isfile(coords_path):
+                full_imgs_dir = os.path.join(avatar_dir, 'full_imgs')
+                frame_count = len(os.listdir(full_imgs_dir)) if os.path.isdir(full_imgs_dir) else 0
+                avatars.append({"id": name, "frame_count": frame_count})
+    return json_ok(data={"avatars": avatars})
+
+
 def setup_avatar_routes(app):
     app.router.add_post("/api/avatar/task", create_avatar_task)
     app.router.add_get("/api/avatar/task/{task_id}", get_avatar_task_status)
     app.router.add_delete("/api/avatar/task/{task_id}", delete_avatar_task)
     app.router.add_get("/api/avatar/tasks", list_avatar_tasks)
+    app.router.add_get("/api/avatar/list", list_avatars)

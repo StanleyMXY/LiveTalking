@@ -23,6 +23,7 @@ import torch
 import numpy as np
 
 import os
+import re
 import time
 import cv2
 import glob
@@ -69,7 +70,11 @@ def load_model(path):
     model = model.to(device)
     return model.eval()
 
+_SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
 def load_avatar(avatar_id):
+    if not _SAFE_ID_RE.match(avatar_id):
+        raise ValueError(f"invalid avatar_id: {avatar_id!r}")
     avatar_path = f"./data/avatars/{avatar_id}"
     full_imgs_path = f"{avatar_path}/full_imgs" 
     face_imgs_path = f"{avatar_path}/face_imgs" 

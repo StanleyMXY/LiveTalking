@@ -36,6 +36,7 @@ import soundfile as sf
 import asyncio
 from enum import Enum
 import json
+import copy
 import importlib
 import registry
 
@@ -100,11 +101,41 @@ class BaseAvatar:
             'omnitts': 'tts.omnitts'
         }
 
-        if opt.tts in _tts_modules:
-            importlib.import_module(_tts_modules[opt.tts])
-            self.tts = registry.create("tts", opt.tts, opt=opt, parent=self)
-        else:
-            logger.error(f"TTS module {opt.tts} not found.")
+        # 多后端 TTS：同时常驻，dashboard 通过 datainfo['tts']['backend'] 逐条请求选择。
+        # tts_backends 缺失/为空时，用旧的平铺 tts/REF_FILE/REF_TEXT/TTS_SERVER 字段
+        # 合成一个单元素默认列表，兼容旧配置。
+        tts_backend_entries = getattr(opt, 'tts_backends', None) or [{
+            'id': opt.tts, 'module': opt.tts,
+        }]
+
+        self.tts_backends = {}
+        self.default_tts_id = tts_backend_entries[0]['id']
+        for entry in tts_backend_entries:
+            backend_id = entry['id']
+            module_name = entry['module']
+            if module_name not in _tts_modules:
+                logger.error(f"TTS module {module_name} not found, skip backend '{backend_id}'.")
+                continue
+            sub_opt = copy.copy(opt)
+            for key, value in entry.items():
+                if key in ('id', 'module'):
+                    continue
+                setattr(sub_opt, key, value)
+            sub_opt.tts = module_name
+            try:
+                importlib.import_module(_tts_modules[module_name])
+                self.tts_backends[backend_id] = registry.create("tts", module_name, opt=sub_opt, parent=self)
+                logger.info(f"TTS backend '{backend_id}' ({module_name}) ready.")
+            except Exception:
+                logger.exception(f"Failed to init TTS backend '{backend_id}' ({module_name}), skipping.")
+
+        if not self.tts_backends:
+            logger.error("No TTS backend initialized.")
+        elif self.default_tts_id not in self.tts_backends:
+            self.default_tts_id = next(iter(self.tts_backends))
+
+        # 兼容其他可能直接引用 self.tts 的代码
+        self.tts = self.tts_backends.get(self.default_tts_id)
 
         _output_modules = {
             'webrtc': 'streamout.webrtc',
@@ -125,8 +156,13 @@ class BaseAvatar:
 
     # 如果系统没有使用 pipeline，或者为了向后兼容原来的 ttsreal.py
     def put_msg_txt(self, msg, datainfo:dict={}):
-        if hasattr(self, 'tts'):
-            self.tts.put_msg_txt(msg, datainfo)
+        backend_id = datainfo.get('tts', {}).get('backend', self.default_tts_id)
+        tts_backend = self.tts_backends.get(backend_id)
+        if tts_backend is None:
+            logger.warning(f"Unknown TTS backend '{backend_id}', falling back to default '{self.default_tts_id}'.")
+            tts_backend = self.tts_backends.get(self.default_tts_id)
+        if tts_backend is not None:
+            tts_backend.put_msg_txt(msg, datainfo)
     
     def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict={}): # 16khz 20ms pcm
         if hasattr(self, 'asr'):
@@ -183,11 +219,12 @@ class BaseAvatar:
         return stream
 
     def flush_talk(self):
-        if hasattr(self, 'tts') and hasattr(self.tts, 'flush_talk'):
-            self.tts.flush_talk()
+        for tts_backend in self.tts_backends.values():
+            if hasattr(tts_backend, 'flush_talk'):
+                tts_backend.flush_talk()
         if hasattr(self, 'asr') and hasattr(self.asr, 'flush_talk'):
             self.asr.flush_talk()
-        self.custom_audiotype = 0  
+        self.custom_audiotype = 0
 
     # def flush(self):
     #     self.flush_talk()
@@ -470,7 +507,8 @@ class BaseAvatar:
         self.quit_event = quit_event
         
         self.init_customindex()
-        self.tts.render(quit_event)
+        for tts_backend in self.tts_backends.values():
+            tts_backend.render(quit_event)
 
         infer_quit_event = mp.Event()
         infer_thread = Thread(target=self.inference, args=(infer_quit_event,))

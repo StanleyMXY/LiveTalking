@@ -298,6 +298,7 @@
                     <div class="card-body p-0">
                         <div class="video-container">
                             <video id="video" autoplay playsinline></video>
+                            <audio id="audio" autoplay></audio>
                             <div class="recording-indicator" id="recording-indicator">
                                 <div class="blink"></div>
                                 <span>录制中</span>
@@ -344,6 +345,77 @@
                                         </div>
                                     </div>
                                 </div>
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label for="tts-backend-select" class="form-label">TTS 后端</label>
+                                        <select class="form-select" id="tts-backend-select">
+                                            <option value="">加载中...</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label for="tts-voice-select" class="form-label">音色</label>
+                                        <select class="form-select" id="tts-voice-select">
+                                            <option value="">(默认)</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label d-block">ASR 方式</label>
+                                        <div class="form-check form-check-inline">
+                                            <input class="form-check-input" type="radio" name="asr-mode" id="asr-mode-local" value="local" checked>
+                                            <label class="form-check-label" for="asr-mode-local">本地 SenseVoice</label>
+                                        </div>
+                                        <div class="form-check form-check-inline">
+                                            <input class="form-check-input" type="radio" name="asr-mode" id="asr-mode-browser" value="browser">
+                                            <label class="form-check-label" for="asr-mode-browser">浏览器语音识别</label>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6 mb-3">
+                                        <label for="avatar-select" class="form-label">数字人形象</label>
+                                        <select class="form-select" id="avatar-select">
+                                            <option value="">(服务端默认)</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <hr>
+                                <h6>克隆新声音</h6>
+                                <form id="voice-clone-form" class="row g-2 align-items-end mb-2">
+                                    <div class="col-md-3">
+                                        <label class="form-label">音频文件</label>
+                                        <input type="file" class="form-control form-control-sm" id="voice-clone-file" accept="audio/*" required>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <label class="form-label">名字</label>
+                                        <input type="text" class="form-control form-control-sm" id="voice-clone-name" placeholder="my_voice" required>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">文字稿（留空自动转写）</label>
+                                        <input type="text" class="form-control form-control-sm" id="voice-clone-transcript">
+                                    </div>
+                                    <div class="col-md-2">
+                                        <button type="submit" class="btn btn-outline-primary btn-sm w-100">克隆</button>
+                                    </div>
+                                </form>
+                                <div id="voice-clone-status" class="form-text"></div>
+
+                                <hr>
+                                <h6>定制数字人形象</h6>
+                                <form id="avatar-upload-form" class="row g-2 align-items-end mb-2">
+                                    <div class="col-md-5">
+                                        <label class="form-label">视频或图片</label>
+                                        <input type="file" class="form-control form-control-sm" id="avatar-upload-file" accept="video/*,image/*" required>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">形象名字</label>
+                                        <input type="text" class="form-control form-control-sm" id="avatar-upload-id" placeholder="my_avatar" required>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <button type="submit" class="btn btn-outline-primary btn-sm w-100">生成形象</button>
+                                    </div>
+                                </form>
+                                <div id="avatar-task-status" class="form-text"></div>
                             </div>
                         </div>
                     </div>
@@ -466,6 +538,179 @@
                 messagesContainer.scrollTop(messagesContainer[0].scrollHeight);
             }
 
+            // ===== TTS 后端选择（从 /api/admin/config 动态加载，不硬编码） =====
+            function loadVoicesForBackend(backendId) {
+                const $voiceSelect = $('#tts-voice-select');
+                if (!backendId) {
+                    $voiceSelect.empty().append('<option value="">(默认)</option>');
+                    return;
+                }
+                fetch('/api/tts/voices?backend=' + encodeURIComponent(backendId)).then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    const voices = (res.data && res.data.voices) || [];
+                    $voiceSelect.empty().append('<option value="">(默认)</option>');
+                    voices.forEach(function(v) {
+                        $voiceSelect.append(`<option value="${v}">${v}</option>`);
+                    });
+                }).catch(function(err) {
+                    console.error('加载音色列表失败:', err);
+                    $voiceSelect.empty().append('<option value="">(默认)</option>');
+                });
+            }
+
+            fetch('/api/admin/config').then(function(res) {
+                return res.json();
+            }).then(function(res) {
+                const backends = (res.data && res.data.config && res.data.config.tts_backends) || [];
+                const $select = $('#tts-backend-select');
+                $select.empty();
+                if (backends.length === 0) {
+                    $select.append('<option value="">(使用服务端默认)</option>');
+                    return;
+                }
+                backends.forEach(function(b) {
+                    $select.append(`<option value="${b.id}">${b.id} (${b.module})</option>`);
+                });
+                loadVoicesForBackend($select.val());
+            }).catch(function(err) {
+                console.error('加载 TTS 后端列表失败:', err);
+                $('#tts-backend-select').empty().append('<option value="">(加载失败，使用默认)</option>');
+            });
+
+            $('#tts-backend-select').on('change', function() {
+                loadVoicesForBackend($(this).val());
+            });
+
+            function currentTtsPayload() {
+                const backend = $('#tts-backend-select').val();
+                const voice = $('#tts-voice-select').val();
+                if (!backend) return {};
+                const tts = { backend: backend };
+                if (voice) tts.ref_file = voice;
+                return { tts: tts };
+            }
+
+            // ===== 数字人形象选择 + 定制上传 =====
+            function loadAvatarList() {
+                const $avatarSelect = $('#avatar-select');
+                const current = $avatarSelect.val();
+                fetch('/api/avatar/list').then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    const avatars = (res.data && res.data.avatars) || [];
+                    $avatarSelect.empty().append('<option value="">(服务端默认)</option>');
+                    avatars.forEach(function(a) {
+                        $avatarSelect.append(`<option value="${a.id}">${a.id} (${a.frame_count} 帧)</option>`);
+                    });
+                    if (current) $avatarSelect.val(current);
+                }).catch(function(err) {
+                    console.error('加载形象列表失败:', err);
+                });
+            }
+            loadAvatarList();
+
+            $('#voice-clone-form').on('submit', function(e) {
+                e.preventDefault();
+                const fileInput = document.getElementById('voice-clone-file');
+                const name = $('#voice-clone-name').val().trim();
+                const transcript = $('#voice-clone-transcript').val().trim();
+                const backend = $('#tts-backend-select').val();
+                if (!fileInput.files.length || !name || !backend) {
+                    $('#voice-clone-status').text('请先选择音频文件、填写名字，并选中一个 TTS 后端。');
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('audio_file', fileInput.files[0]);
+                formData.append('name', name);
+                formData.append('backend', backend);
+                formData.append('transcript', transcript);
+
+                $('#voice-clone-status').text('克隆中（如需自动转写会稍慢）...');
+                fetch('/api/tts/voices', { method: 'POST', body: formData }).then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    if (res.code === 0) {
+                        $('#voice-clone-status').text('克隆成功: ' + name);
+                        loadVoicesForBackend(backend);
+                    } else {
+                        $('#voice-clone-status').text('失败: ' + res.msg);
+                    }
+                }).catch(function(err) {
+                    $('#voice-clone-status').text('请求失败: ' + err);
+                });
+            });
+
+            let avatarPollTimer = null;
+            function pollAvatarTask(taskId) {
+                if (avatarPollTimer) clearInterval(avatarPollTimer);
+                avatarPollTimer = setInterval(function() {
+                    fetch('/api/avatar/task/' + taskId).then(function(res) {
+                        return res.json();
+                    }).then(function(res) {
+                        if (res.code !== 0) {
+                            $('#avatar-task-status').text('查询失败: ' + res.msg);
+                            clearInterval(avatarPollTimer);
+                            return;
+                        }
+                        const task = res.data;
+                        $('#avatar-task-status').text(`生成中: ${task.status} (${task.progress}%)`);
+                        if (task.status === 'completed') {
+                            $('#avatar-task-status').text('生成完成: ' + task.avatar_id);
+                            clearInterval(avatarPollTimer);
+                            loadAvatarList();
+                        } else if (task.status === 'failed') {
+                            $('#avatar-task-status').text('生成失败: ' + task.error_msg);
+                            clearInterval(avatarPollTimer);
+                        }
+                    }).catch(function(err) {
+                        console.error('轮询任务状态失败:', err);
+                    });
+                }, 2000);
+            }
+
+            $('#avatar-upload-form').on('submit', function(e) {
+                e.preventDefault();
+                const fileInput = document.getElementById('avatar-upload-file');
+                const avatarId = $('#avatar-upload-id').val().trim();
+                if (!fileInput.files.length || !avatarId) {
+                    $('#avatar-task-status').text('请先选择视频/图片文件并填写形象名字。');
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('video_file', fileInput.files[0]);
+                formData.append('model', 'wav2lip');
+                formData.append('avatar_id', avatarId);
+
+                $('#avatar-task-status').text('上传中...');
+                fetch('/api/avatar/task', { method: 'POST', body: formData }).then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    if (res.code === 0) {
+                        $('#avatar-task-status').text('任务已提交: ' + res.data.task_id);
+                        pollAvatarTask(res.data.task_id);
+                    } else {
+                        $('#avatar-task-status').text('提交失败: ' + res.msg);
+                    }
+                }).catch(function(err) {
+                    $('#avatar-task-status').text('请求失败: ' + err);
+                });
+            });
+
+            // 识别到的文本统一走这里发送，供本地 ASR / 浏览器 ASR 共用
+            function sendRecognizedText(text) {
+                if (!text) return;
+                fetch('/human', {
+                    body: JSON.stringify(Object.assign({
+                        text: text, type: 'chat', interrupt: true,
+                        sessionid: String(document.getElementById('sessionid').value),
+                    }, currentTtsPayload())),
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'POST'
+                });
+                addChatMessage(text, 'user');
+            }
+
             // 开始/停止按钮
             $('#start').click(function() {
                 updateConnectionStatus('connecting');
@@ -557,18 +802,18 @@
                 console.log('Sending echo message:', message);
                 
                 fetch('/human', {
-                    body: JSON.stringify({
+                    body: JSON.stringify(Object.assign({
                         text: message,
                         type: 'echo',
                         interrupt: true,
                         sessionid: String(document.getElementById('sessionid').value),
-                    }),
+                    }, currentTtsPayload())),
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     method: 'POST'
                 });
-                
+
                 $('#message').val('');
                 addChatMessage(`已发送朗读请求: "${message}"`, 'system');
             });
@@ -578,16 +823,16 @@
                 e.preventDefault();
                 var message = $('#chat-message').val();
                 if (!message.trim()) return;
-                
+
                 console.log('Sending chat message:', message);
-                
+
                 fetch('/human', {
-                    body: JSON.stringify({
+                    body: JSON.stringify(Object.assign({
                         text: message,
                         type: 'chat',
                         interrupt: true,
                         sessionid: String(document.getElementById('sessionid').value),
-                    }),
+                    }, currentTtsPayload())),
                     headers: {
                         'Content-Type': 'application/json'
                     },
@@ -598,125 +843,199 @@
                 $('#chat-message').val('');
             });
 
-            // 按住说话功能
-            let mediaRecorder;
-            let audioChunks = [];
+
+            // ===== 本地 SenseVoice ASR (WebSocket) =====
+            let asrWs = null;
+            let audioCtx = null;
+            let asrProcessor = null;
+            let micStream = null;
             let isRecording = false;
-            let recognition;
-            
-            // 检查浏览器是否支持语音识别
-            const isSpeechRecognitionSupported = 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
-            
-            if (isSpeechRecognitionSupported) {
-                recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
-                recognition.continuous = true;
-                recognition.interimResults = true;
-                recognition.lang = 'zh-CN';
-                
-                recognition.onresult = function(event) {
-                    let interimTranscript = '';
-                    let finalTranscript = '';
-                    
-                    for (let i = event.resultIndex; i < event.results.length; ++i) {
-                        if (event.results[i].isFinal) {
-                            finalTranscript += event.results[i][0].transcript;
-                        } else {
-                            interimTranscript += event.results[i][0].transcript;
-                            $('#chat-message').val(interimTranscript);
-                        }
-                    }
-                    
-                    if (finalTranscript) {
-                        $('#chat-message').val(finalTranscript);
-                    }
-                };
-                
-                recognition.onerror = function(event) {
-                    console.error('语音识别错误:', event.error);
-                };
-            }
-            
-            // 按住说话按钮事件
-            $('#voice-record-btn').on('mousedown touchstart', function(e) {
-                e.preventDefault();
-                startRecording();
-            }).on('mouseup mouseleave touchend', function() {
-                if (isRecording) {
-                    stopRecording();
+            let pcmBuffer = new Int16Array(0);
+            const ASR_SR = 16000;
+            const ASR_CHUNK = 960;
+
+            function resampleTo16k(float32, srcRate) {
+                if (srcRate === ASR_SR) return float32;
+                const ratio = srcRate / ASR_SR;
+                const len = Math.round(float32.length / ratio);
+                const out = new Float32Array(len);
+                for (let i = 0; i < len; i++) {
+                    const p = i * ratio;
+                    const lo = Math.floor(p);
+                    const hi = Math.min(lo + 1, float32.length - 1);
+                    const f = p - lo;
+                    out[i] = float32[lo] * (1 - f) + float32[hi] * f;
                 }
-            });
-            
-            // 开始录音
-            function startRecording() {
-                if (isRecording) return;
-                
-                navigator.mediaDevices.getUserMedia({ audio: true })
-                    .then(function(stream) {
-                        audioChunks = [];
-                        mediaRecorder = new MediaRecorder(stream);
-                        
-                        mediaRecorder.ondataavailable = function(e) {
-                            if (e.data.size > 0) {
-                                audioChunks.push(e.data);
-                            }
-                        };
-                        
-                        mediaRecorder.start();
-                        isRecording = true;
-                        
-                        $('#voice-record-btn').addClass('recording-pulse');
-                        $('#voice-record-btn').css('background-color', '#dc3545');
-                        
-                        if (recognition) {
-                            recognition.start();
-                        }
-                    })
-                    .catch(function(error) {
-                        console.error('无法访问麦克风:', error);
-                        alert('无法访问麦克风，请检查浏览器权限设置。');
-                    });
+                return out;
             }
 
-            function stopRecording() {
-                if (!isRecording) return;
-                
-                mediaRecorder.stop();
-                isRecording = false;
-                
-                // 停止所有音轨
-                mediaRecorder.stream.getTracks().forEach(track => track.stop());
-                
-                // 视觉反馈恢复
-                $('#voice-record-btn').removeClass('recording-pulse');
-                $('#voice-record-btn').css('background-color', '');
-                
-                // 停止语音识别
-                if (recognition) {
-                    recognition.stop();
+            function floatToPcm16(float32) {
+                const pcm = new Int16Array(float32.length);
+                for (let i = 0; i < float32.length; i++) {
+                    const s = Math.max(-1, Math.min(1, float32[i]));
+                    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
-                
-                // 获取识别的文本并发送
-                setTimeout(function() {
-                    const recognizedText = $('#chat-message').val().trim();
-                    if (recognizedText) {
-                        // 发送识别的文本
-                        fetch('/human', {
-                            body: JSON.stringify({
-                                text: recognizedText,
-                                type: 'chat',
-                                interrupt: true,
-                                sessionid: String(document.getElementById('sessionid').value),
-                            }),
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            method: 'POST'
-                        });
-                        
-                        addChatMessage(recognizedText, 'user');
-                        $('#chat-message').val('');
+                return pcm;
+            }
+
+            function currentAsrMode() {
+                return $('input[name="asr-mode"]:checked').val() || 'local';
+            }
+
+            // 按住说话按钮事件：根据 ASR 方式单选分派到本地 SenseVoice 或浏览器语音识别
+            $('#voice-record-btn').on('mousedown touchstart', function(e) {
+                e.preventDefault();
+                if (currentAsrMode() === 'browser') {
+                    startBrowserASR();
+                } else {
+                    startLocalASR();
+                }
+            }).on('mouseup mouseleave touchend', function() {
+                if (currentAsrMode() === 'browser') {
+                    stopBrowserASR();
+                } else if (isRecording) {
+                    stopLocalASR();
+                }
+            });
+
+            async function startLocalASR() {
+                if (isRecording) return;
+                try {
+                    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } catch (err) {
+                    console.error('无法访问麦克风:', err);
+                    alert('无法访问麦克风，请检查浏览器权限设置。');
+                    return;
+                }
+
+                isRecording = true;
+                pcmBuffer = new Int16Array(0);
+                $('#voice-record-btn').addClass('recording-pulse').css('background-color', '#dc3545');
+                $('.voice-record-label').text('松开发送');
+
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioCtx.createMediaStreamSource(micStream);
+                asrProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+                const silencer = audioCtx.createGain();
+                silencer.gain.value = 0;
+
+                asrProcessor.onaudioprocess = function(e) {
+                    if (!isRecording) return;
+                    const raw = e.inputBuffer.getChannelData(0);
+                    const down = resampleTo16k(raw, audioCtx.sampleRate);
+                    const pcm = floatToPcm16(down);
+                    const merged = new Int16Array(pcmBuffer.length + pcm.length);
+                    merged.set(pcmBuffer);
+                    merged.set(pcm, pcmBuffer.length);
+                    pcmBuffer = merged;
+                    while (pcmBuffer.length >= ASR_CHUNK && asrWs && asrWs.readyState === 1) {
+                        const chunk = pcmBuffer.slice(0, ASR_CHUNK);
+                        pcmBuffer = pcmBuffer.slice(ASR_CHUNK);
+                        asrWs.send(chunk.buffer);
                     }
-                }, 500); 
+                };
+
+                source.connect(asrProcessor);
+                asrProcessor.connect(silencer);
+                silencer.connect(audioCtx.destination);
+
+                const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+                asrWs = new WebSocket(proto + location.host + '/api/asr');
+                asrWs.onopen = function() {
+                    asrWs.send(JSON.stringify({
+                        chunk_size: [5, 10, 5], wav_name: 'h5',
+                        is_speaking: true, chunk_interval: 10,
+                        itn: false, mode: '2pass'
+                    }));
+                };
+                asrWs.onmessage = function(e) {
+                    try {
+                        const data = JSON.parse(e.data);
+                        const text = (data.text || '').replace(/ +/g, '').trim();
+                        sendRecognizedText(text);
+                    } catch (err) { console.error('ASR parse error:', err); }
+                    cleanupASR();
+                };
+                asrWs.onerror = function() {
+                    addChatMessage('语音识别连接失败', 'system');
+                    cleanupASR();
+                };
+            }
+
+            function stopLocalASR() {
+                if (!isRecording) return;
+                isRecording = false;
+                $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
+                $('.voice-record-label').text('识别中...');
+                if (asrProcessor) { asrProcessor.disconnect(); asrProcessor = null; }
+                if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
+                if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
+                if (asrWs && asrWs.readyState === 1) {
+                    if (pcmBuffer.length > 0) {
+                        asrWs.send(pcmBuffer.buffer);
+                        pcmBuffer = new Int16Array(0);
+                    }
+                    asrWs.send(JSON.stringify({
+                        chunk_size: [5, 10, 5], wav_name: 'h5',
+                        is_speaking: false, chunk_interval: 10, mode: '2pass'
+                    }));
+                } else {
+                    cleanupASR();
+                }
+                setTimeout(function() { if (asrWs) { asrWs.close(); asrWs = null; } }, 10000);
+            }
+
+            function cleanupASR() {
+                isRecording = false;
+                $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
+                $('.voice-record-label').text('按住说话，松开发送');
+                if (asrProcessor) { asrProcessor.disconnect(); asrProcessor = null; }
+                if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
+                if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
+                if (asrWs) { asrWs.close(); asrWs = null; }
+            }
+
+            // ===== 浏览器内置语音识别 (webkitSpeechRecognition) =====
+            let browserRecognition = null;
+            let browserAsrActive = false;
+
+            function startBrowserASR() {
+                if (browserAsrActive) return;
+                const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (!SpeechRecognitionImpl) {
+                    alert('当前浏览器不支持语音识别，请使用 Chrome。');
+                    return;
+                }
+                browserAsrActive = true;
+                $('#voice-record-btn').addClass('recording-pulse').css('background-color', '#dc3545');
+                $('.voice-record-label').text('松开发送');
+
+                browserRecognition = new SpeechRecognitionImpl();
+                browserRecognition.lang = 'zh-CN';
+                browserRecognition.interimResults = false;
+                browserRecognition.continuous = false;
+
+                browserRecognition.onresult = function(event) {
+                    const text = event.results[0][0].transcript.trim();
+                    sendRecognizedText(text);
+                };
+                browserRecognition.onerror = function(event) {
+                    console.error('浏览器语音识别错误:', event.error);
+                    addChatMessage('语音识别失败: ' + event.error, 'system');
+                };
+                browserRecognition.onend = function() {
+                    browserAsrActive = false;
+                    $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
+                    $('.voice-record-label').text('按住说话，松开发送');
+                };
+
+                browserRecognition.start();
+            }
+
+            function stopBrowserASR() {
+                if (browserRecognition) {
+                    browserRecognition.stop();
+                }
             }
 
             // WebRTC 相关功能

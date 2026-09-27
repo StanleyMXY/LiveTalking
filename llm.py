@@ -10,7 +10,7 @@ from utils.logger import logger
 LLM_PROVIDERS = {
     "dashscope": {
         "api_key_env": "DASHSCOPE_API_KEY",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         "default_model": "qwen-plus",
     },
     "orcarouter": {

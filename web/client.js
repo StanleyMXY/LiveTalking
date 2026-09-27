@@ -22,11 +22,13 @@ function negotiate() {
         });
     }).then(() => {
         var offer = pc.localDescription;
+        var body = { sdp: offer.sdp, type: offer.type };
+        var avatarEl = document.getElementById('avatar-select');
+        if (avatarEl && avatarEl.value) {
+            body.avatar = avatarEl.value;
+        }
         return fetch('/offer', {
-            body: JSON.stringify({
-                sdp: offer.sdp,
-                type: offer.type,
-            }),
+            body: JSON.stringify(body),
             headers: {
                 'Content-Type': 'application/json'
             },

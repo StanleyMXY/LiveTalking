@@ -24,6 +24,11 @@ except ImportError:
 SRC_SR = 24000   # Qwen TTS 只支持 24kHz 输出
 DST_SR = 16000   # 项目标准采样率
 
+PRESET_VOICES = {
+    'Cherry', 'Ethan', 'Serena', 'Daniel', 'Chelsie',
+    'Aidan', 'Vivienne', 'Aria', 'Alya', 'Ravi',
+}
+
 
 @register("tts", "qwentts")
 class QwenTTS(BaseTTS):
@@ -43,11 +48,15 @@ class QwenTTS(BaseTTS):
 
         # 音色名, 复用 REF_FILE 参数
         self.voice = opt.REF_FILE if opt.REF_FILE else 'Cherry'
-        # 模型名
-        self.model = getattr(opt, 'qwen_tts_model', 'qwen3-tts-flash-realtime')
+        # 模型名: 克隆声音(voice_id 较长)自动切换到 vc-realtime 模型
+        default_model = 'qwen3-tts-flash-realtime'
+        if self.voice and self.voice not in PRESET_VOICES:
+            default_model = 'qwen3-tts-vc-realtime-2026-01-15'
+            logger.info(f"QwenTTS: 检测到克隆声音 ID，切换到 VC 模型: {default_model}")
+        self.model = getattr(opt, 'qwen_tts_model', default_model)
         # WebSocket URL
         self.ws_url = getattr(opt, 'qwen_tts_url',
-                              'wss://dashscope.aliyuncs.com/api-ws/v1/realtime')
+                              'wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime')
 
         # 设置 DashScope API Key
         api_key = getattr(opt, 'dashscope_api_key', None) or os.environ.get('DASHSCOPE_API_KEY')

@@ -17,10 +17,23 @@ batch_size: 16
 customvideo_config: ''
 
 # -------- TTS ----------------------------------------------------------
-tts: edgetts                   # edgetts / gpt-sovits / cosyvoice / fishtts / tencent / doubao / indextts2 / azuretts / qwentts
-REF_FILE: ''                   # voice name or reference audio file path (wav, 16kHz, mono)
+# 旧的单后端字段保留：admin.html 展示、refaudio/reftext 会话覆盖兼容、
+# 以及 tts_backends 为空时的回退默认值。
+tts: qwentts                   # edgetts / gpt-sovits / cosyvoice / fishtts / tencent / doubao / indextts2 / azuretts / qwentts
+REF_FILE: 'Cherry'             # voice name or reference audio file path (wav, 16kHz, mono)
 REF_TEXT: ''                   # reference text for voice cloning (English or Chinese)
 TTS_SERVER: ''                 # TTS server URL, no trailing slash
+
+# 多个 TTS 后端同时常驻，dashboard.html 通过 tts: {backend: <id>} 逐条请求选择。
+# 列表第一项为默认后端。不要在这里写密钥——/api/admin/config 未鉴权会原样吐出去，
+# 用环境变量 DASHSCOPE_API_KEY 代替。
+tts_backends:
+  - id: qwentts_cherry
+    module: qwentts
+  - id: cosyvoice_local
+    module: omnitts
+    TTS_SERVER: 'http://127.0.0.1:8091'
+    REF_FILE: 'zhizunbao'
 
 # -------- LLM ----------------------------------------------------------
 llm_provider: dashscope        # dashscope / orcarouter

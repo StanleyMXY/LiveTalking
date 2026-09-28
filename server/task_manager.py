@@ -83,8 +83,20 @@ class TaskManager:
         logger.info(f"Starting task {task_id} for model {task.model_type}, avatar {task.avatar_id}")
 
         try:
+            from server.avatar_routes import IMAGE_EXTS, animate_image_with_sadtalker
+
+            video_path = task.params['video_path']
+            is_image = os.path.splitext(video_path)[1].lower() in IMAGE_EXTS
+
             def progress_callback(p):
-                task.progress = p
+                task.progress = 50 + p // 2 if is_image else p
+
+            if is_image:
+                def sadtalker_progress(p):
+                    task.progress = p // 2
+                video_path = animate_image_with_sadtalker(video_path, progress_callback=sadtalker_progress)
+                task.params['video_path'] = video_path
+                task.progress = 50
 
             if task.model_type == "musetalk":
                 from avatars.musetalk.genavatar import generate_avatar

@@ -9,7 +9,11 @@ from utils.logger import logger
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-IMAGE_TO_VIDEO_FRAMES = 120
+
+SADTALKER_DIR = os.getenv('SADTALKER_DIR', 'D:/Projects/SadTalker')
+SADTALKER_PYTHON = os.path.join(SADTALKER_DIR, '.venv', 'Scripts', 'python.exe')
+SADTALKER_TORCH_HOME = os.path.join(SADTALKER_DIR, 'checkpoints', 'hub')
+IDLE_DRIVER_AUDIO = os.path.abspath('./assets/sadtalker_idle_silence.wav')
 
 def json_ok(data=None):
     body = {"code": 0, "msg": "ok"}
@@ -26,21 +30,43 @@ def json_error(msg: str, code: int = -1):
         text=json.dumps({"code": code, "msg": str(msg)}),
     )
 
-def _image_to_video(image_path: str) -> str:
-    """把一张静态图片重复写成一个短视频，供 genavatar.py 的视频输入管线复用。"""
-    import cv2
+def animate_image_with_sadtalker(image_path: str, progress_callback=None) -> str:
+    """用 SadTalker 给静态照片生成一段带自然头部动作(眨眼)的短视频，供 genavatar.py 的视频输入管线复用。"""
+    import glob
+    import shutil
+    import subprocess
+    import uuid as uuid_mod
 
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"failed to read image: {image_path}")
-    h, w = img.shape[:2]
+    if progress_callback:
+        progress_callback(5)
 
-    synth_path = image_path + "_synth.mp4"
-    writer = cv2.VideoWriter(synth_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
-    for _ in range(IMAGE_TO_VIDEO_FRAMES):
-        writer.write(img)
-    writer.release()
-    return synth_path
+    result_dir = os.path.abspath(f'./data/tmp/sadtalker_{uuid_mod.uuid4()}')
+    os.makedirs(result_dir, exist_ok=True)
+    env = os.environ.copy()
+    env['TORCH_HOME'] = SADTALKER_TORCH_HOME
+
+    proc = subprocess.run(
+        [SADTALKER_PYTHON, os.path.join(SADTALKER_DIR, 'inference.py'),
+         '--driven_audio', IDLE_DRIVER_AUDIO,
+         '--source_image', os.path.abspath(image_path),
+         '--result_dir', result_dir,
+         '--still', '--preprocess', 'full', '--size', '256'],
+        cwd=SADTALKER_DIR, env=env,
+        capture_output=True, text=True,
+    )
+
+    mp4s = glob.glob(os.path.join(result_dir, '*.mp4'))
+    if proc.returncode != 0 or not mp4s:
+        shutil.rmtree(result_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"SadTalker failed to animate image (exit {proc.returncode}): "
+            f"{proc.stderr[-2000:] or proc.stdout[-2000:]}"
+        )
+
+    out_path = image_path + "_sadtalker.mp4"
+    shutil.move(mp4s[0], out_path)
+    shutil.rmtree(result_dir, ignore_errors=True)
+    return out_path
 
 
 async def create_avatar_task(request):
@@ -95,10 +121,6 @@ async def create_avatar_task(request):
         video_path = params['video_path']
         if not os.path.isabs(video_path):
             video_path = os.path.join(data_path, video_path)
-
-        ext = os.path.splitext(video_path)[1].lower()
-        if ext in IMAGE_EXTS:
-            video_path = _image_to_video(video_path)
 
         save_path = data_path
 

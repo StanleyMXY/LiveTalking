@@ -59,3 +59,6 @@ dashscope
 
 # LiveKit connection shell (livekit_bridge/) — provides livekit.rtc
 livekit==1.1.20
+
+# Testing: tests/test_livekit_output.py uses @pytest.mark.asyncio
+pytest-asyncio

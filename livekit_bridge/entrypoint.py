@@ -1,12 +1,12 @@
 """
-livekit_bridge.entrypoint — Task 8: the LiveKit Agent entrypoint that wires
-together Tasks 2-7 (``audio_format``, ``utterance_buffer``, ``asr_bridge``,
-``pipeline_bridge``, ``session_registry``) and ``streamout.livekit_output``
-into one per-room job.
+livekit_bridge.entrypoint — the LiveKit Agent entrypoint that wires together
+``audio_format``, ``utterance_buffer``, ``barge_in_detector``,
+``asr_bridge``, ``pipeline_bridge``, ``session_registry`` and
+``streamout.livekit_output`` into one per-room job.
 
-The brief's draft code (``task-8-brief.md``) is stale in several places it
-itself flags with a warning marker. Every correction below was verified by
-reading the *installed* ``livekit-agents==1.8.3`` / ``livekit==1.1.18``
+The plan's original draft of this module guessed several SDK APIs. Every
+correction below was verified by reading the *installed*
+``livekit-agents==1.8.3`` / ``livekit==1.1.18``
 source (this repo's ``requirements.txt`` now pins both; see the comment
 there for why the previously-pinned ``livekit==1.1.20`` had to move — a
 downgrade that was checked byte-for-byte against Task 1/4's dependencies
@@ -36,9 +36,9 @@ Verified facts, with citations
   See ``_room_name_from_job`` below.
 - **Dispatch metadata**: ``agent.Job`` really does have a top-level
   ``metadata`` string field (verified against the ``Job`` descriptor), so
-  the brief's field name (``ctx.job.metadata``) was right. Its *contents*
+  the draft's field name (``ctx.job.metadata``) was right. Its *contents*
   (does the Java dispatcher put a bare account_id there, or a JSON blob?)
-  are not established anywhere in this repo, this task's brief, or the
+  are not established anywhere in this repo, the plan, or the
   connection-shell spec (``docs/superpowers/specs/2026-09-29-app-shell-cloud-
   integration-design.md`` §5/6, as linked from the plan) — grepping this
   repo and the plan for ``account_id`` finds nothing. Parsing an unverified
@@ -71,7 +71,7 @@ Verified facts, with citations
 - ``audio_stream.aclose()`` releases the native stream/FFI handle
   (``livekit/rtc/audio_stream.py:318``) — called in ``entrypoint``'s
   ``finally``.
-- **Publishing the synthesized voice back to the room**: the brief guessed
+- **Publishing the synthesized voice back to the room**: the draft guessed
   ``ctx.room.local_participant.create_audio_source()`` — no such method
   exists on ``LocalParticipant`` or ``Room`` in the installed SDK.
   ``rtc.AudioSource`` is a plain constructor
@@ -101,9 +101,9 @@ Verified facts, with citations
   ``livekit_bridge/worker_app.py``); a human productionizing this later may
   want to look at the newer ``AgentServer`` path instead.
 
-Interrupt-handling design (not fully spelled out by the brief)
-----------------------------------------------------------------
-The brief suggests, as a simplest-correct-option fallback, calling
+Interrupt-handling design
+-------------------------
+The plan's draft suggested, as a simplest-correct-option fallback, calling
 ``pipeline_bridge.interrupt()`` "unconditionally" on every silence→speech
 transition, reasoning that ``flush_talk()`` is documented as a safe no-op
 when nothing is playing. That reasoning is fine for ``interrupt()`` itself,
@@ -116,19 +116,25 @@ often than genuine "user started talking again" events. Wiping
 ``utterance_buffer``'s accumulated audio on every such micro-transition
 would mean it could never accumulate a complete utterance.
 
-The task's own wording actually already names the correct gating
-condition: "when the user starts speaking again *while the avatar is still
-talking*". "The avatar is still talking" is exactly
-``avatar_session.is_speaking()`` (``avatars/base_avatar.py:232-233``, a
-real, pre-existing method — not something invented for this task). Gating
-the interrupt+reset pair on ``is_speech and not was_speech and
-avatar_session.is_speaking()`` implements the requirement as literally
-stated, and avoids the false-trigger bug above: a genuine mid-utterance
-pause essentially never coincides with the avatar *also* happening to be
-mid-speech, and once a real barge-in has fired once, the avatar stops
-speaking almost immediately (``flush_talk()``), so ``is_speaking()`` goes
-false and further micro-pauses in the same (new) utterance no longer
-re-trigger it. See ``_process_frame`` below.
+The requirement itself names the correct gating condition: "when the user
+starts speaking again *while the avatar is still talking*". "The avatar is
+still talking" is exactly ``avatar_session.is_speaking()``
+(``avatars/base_avatar.py:232-233``, a real, pre-existing method). Once a
+real barge-in has fired, the avatar stops speaking almost immediately
+(``flush_talk()``), so ``is_speaking()`` goes false and further
+micro-pauses in the same (new) utterance no longer re-trigger it.
+
+"Starts speaking" must mean *sustained* speech, not one frame (final-review
+finding). An earlier version fired on a single 20ms frame above the energy
+threshold, so one cough or click interrupted a correct answer — usually
+with nothing to replace it, because that noise's own utterance transcribes
+to a SenseVoice non-speech marker that ``AsrBridge`` now filters to ``""``.
+``_process_frame`` now asks ``BargeInDetector`` (``barge_in_detector.py``),
+which reports a speech onset only after 240ms of consecutive above-threshold
+frames, once per run; the barge-in fires if the avatar is speaking at that
+moment. On a barge-in the buffer is reset (dropping stale audio from before
+the onset) and the run's earlier frames are fed back in, so the new
+utterance keeps its first 220ms. See ``_process_frame`` below.
 
 Interrupt must also clear LiveKit's own audio backlog (code review finding)
 ------------------------------------------------------------------------------
@@ -143,11 +149,12 @@ internal queue (default up to 1000ms — ``livekit/rtc/audio_source.py:38``,
 touches; without clearing it too, an interrupt would still let up to a
 second of stale, already-queued speech play out before new speech starts.
 ``AudioSource.clear_queue()`` (``audio_source.py:88-100``) exists exactly
-for this. On a detected barge-in, ``_process_frame`` calls
-``avatar_session.output.clear_queue()`` if the current output exposes one
-(the same optional-capability ``hasattr`` pattern
+for this. Whenever the current response is superseded (a barge-in, or a
+newer meaningful utterance — ``_supersede_in_flight_response``), this
+module calls ``avatar_session.output.clear_queue()`` if the current output
+exposes one (the same optional-capability ``hasattr`` pattern
 ``avatars/base_avatar.py:529`` already uses for ``get_buffer_size()``), in
-addition to ``pipeline_bridge.interrupt()``/``utterance_buffer.reset()``.
+addition to ``pipeline_bridge.interrupt()``.
 
 The frame-iteration loop must not stall waiting for the LLM (code review finding)
 --------------------------------------------------------------------------------------
@@ -170,88 +177,74 @@ transcribe-then-drive sequence as a tracked background task
 garbage-collected mid-flight and so its exceptions are logged via a
 done-callback instead of silently dropped) and returns immediately,
 letting the frame loop keep draining and keep detecting interrupts while
-the LLM streams. A known, separate, out-of-scope gap (not fixed here, per
-code review guidance not to make it worse without a real fix): there is no
-LLM cancellation token anywhere in ``llm.py``, so after ``flush_talk()`` an
-already-in-flight ``llm_response`` call still runs to completion and still
-calls ``avatar_session.put_msg_txt`` for the old answer once it finishes —
-``entrypoint.py``'s ``finally`` block cancels any *not-yet-started*
-background task (preventing a queued-but-not-running
-``drive_with_text`` call from firing against a torn-down session) but
-cannot stop a call that is already executing inside the executor thread.
+the LLM streams. A known, separate, out-of-scope gap: there is no LLM
+cancellation token anywhere in ``llm.py``, so after an interrupt an
+already-in-flight ``llm_response`` call still streams to completion and
+still consumes LLM tokens — its ``put_msg_txt`` calls are turned into
+no-ops by ``PipelineBridge``'s generation fence (see the next section), but
+the call itself cannot be stopped. ``entrypoint``'s ``finally`` block
+cancels any *not-yet-started* background task (preventing a
+queued-but-not-running ``drive_with_text`` call from firing against a
+torn-down session) but cannot stop a call that is already executing
+inside the executor thread. Listed in ``livekit_bridge/__init__.py``'s
+"Known limitations".
 
-At most one *tracked* drive task per session — but that alone does not stop interleaving (code review follow-up finding, corrected below)
-------------------------------------------------------------------------------------------------------------------------------------------------
-Scheduling every completed utterance as its own independent background
-task (the fix directly above) introduced a new problem: nothing stopped
-two of them from running concurrently. ``UtteranceBuffer`` cuts an
-utterance at 500ms of silence, and a user pausing mid-thought — or simply
-an LLM response taking longer than 500ms to *start* producing audio, which
-is common — routinely produces a second completed utterance while the
-first one's ``drive_with_text`` task is still running. The existing
-barge-in check (``is_speech and not was_speech and
-avatar_session.is_speaking()``) does not catch this: it fires on a
-*speech-onset* transition, but ``utterance_buffer.feed()`` only returns a
-completed utterance on a *silence* chunk, and at that point
-``avatar_session.is_speaking()`` may still be ``False`` (the previous
-task's LLM call may not have produced its first audio chunk yet) even
-though its task is very much still running. Left unfixed, both
-``llm_response`` calls run in parallel and both call
-``avatar_session.put_msg_txt`` (``llm.py:62-87``), interleaving two
-answers' TTS fragments into the same session.
+Every meaningful utterance supersedes the previous response
+-----------------------------------------------------------
+Scheduling every completed utterance as its own background task (the
+section above) means two can be in flight at once: ``UtteranceBuffer``
+cuts an utterance at 500ms of silence, so a user pausing mid-thought
+produces a second utterance while the first one's answer is still being
+generated or played. Left alone, both answers' TTS fragments interleave.
 
 Two designs were possible: queue completed utterances and drive them one
-at a time (FIFO), or treat a new utterance completing mid-response as an
-implicit interrupt of that response (supersede). Supersede was chosen:
-this plan's whole interrupt model is built around "the user's most recent
-utterance is the one that matters" (the barge-in check above already
-embodies exactly that policy for the mid-speech case), and a real-time
-conversational avatar answering an ordinary mid-thought pause with a
-disjointed reply to just the fragment before the pause — then, once that
-finishes, *also* replying to the fragment after it — is not better
-behavior than cutting the first (likely-incomplete) response short and
-answering the newer one; unbounded queueing would also let a user who
-keeps pausing accumulate an ever-growing backlog of answers. Neither
-design can fix the deeper cause (``UtteranceBuffer``'s segmentation has
-already split what may have been one continuous thought into two ASR
-calls by the time either sees it) — that is unrelated to this fix.
+at a time (FIFO), or treat a new utterance as an implicit interrupt of the
+previous response (supersede). Supersede was chosen: this plan's whole
+interrupt model is built around "the user's most recent utterance is the
+one that matters" (the barge-in check above embodies exactly that policy
+for the mid-speech case), and a real-time conversational avatar answering
+an ordinary mid-thought pause with a disjointed reply to just the fragment
+before the pause — then, once that finishes, *also* replying to the
+fragment after it — is not better behavior than cutting the first
+(likely-incomplete) response short and answering the newer one; unbounded
+queueing would also let a user who keeps pausing accumulate an
+ever-growing backlog of answers. Neither design can fix the deeper cause
+(``UtteranceBuffer``'s segmentation has already split what may have been
+one continuous thought into two ASR calls) — that is unrelated to this.
 
-``_supersede_in_flight_response`` is now the single implementation shared
-by both trigger points (mid-speech barge-in, and a new utterance
-completing while ``pending_tasks`` still holds an unfinished one): it calls
-``pipeline_bridge.interrupt()``, cancels every not-yet-finished pending
-task (``_cancel_pending_drive_tasks``), and clears the output's own queue
-if it exposes one. ``_process_frame`` calls it before starting a new drive
-task whenever ``pending_tasks`` still contains an unfinished one, which
-means at most one *asyncio Task* is ever tracked in ``pending_tasks`` per
-session by construction.
+When supersede fires (final-review finding). An earlier version
+superseded only if some drive task was still running (``not
+task.done()``) at the moment a new utterance completed. That misses the
+common case: ``llm_response`` returns as soon as it has *enqueued* its
+sentences (``llm.py:45-87``: each ``put_msg_txt`` is a non-blocking
+``Queue.put``, ``tts/base_tts.py:34-36``), and ``BaseTTS.process_tts``
+plays them afterward on its own thread (``tts/base_tts.py:42-49``). So the
+drive task is ``done()`` while most of the old answer is still to be
+spoken, and a new utterance was queued behind it instead of replacing it.
+Now ``_drive_avatar_with_transcription`` supersedes unconditionally —
+``pipeline_bridge.interrupt()`` (generation-fence bump + ``flush_talk()``)
+plus ``output.clear_queue()``, via ``_supersede_in_flight_response`` — for
+every utterance that (a) transcribes to meaningful text and (b) is the
+newest one to get that far. It is done after ASR rather than when the
+utterance completes because only then is it known whether the utterance
+was speech at all: a cough (transcribed to a filtered-out marker,
+``asr_bridge.py``) must not cut off the answer that is playing. Both
+calls are safe when nothing is playing (see
+``_supersede_in_flight_response``). (b) is ``_UtteranceOrder``:
+transcriptions run in the executor and can finish out of order, so each
+completed utterance gets a sequence number when it completes, and one
+whose ASR finishes after a newer one has already committed is dropped.
 
-That is **not** the same as "at most one response is ever being generated"
-— an earlier version of this docstring conflated the two, which a code
-review caught as actively misleading. Cancelling the asyncio ``Task``
-only has an effect if the cancellation lands while it is still awaiting
-``asr_bridge.transcribe`` (stage 1): the coroutine then never resumes to
-reach ``drive_with_text`` (stage 2), so nothing further happens. But once
-a task has already reached stage 2 and ``llm_response`` is executing
-inside its own executor thread, cancelling the asyncio side does nothing
-to that thread — ``llm_response`` has no cancellation checkpoint anywhere
-in its streaming loop and keeps calling ``avatar_session.put_msg_txt``
-regardless. Given this plan's own timing (a 500ms silence cut vs.
-realistic LLM response latency), reaching stage 2 before a superseding
-utterance completes is the *common* case, not a rare one — so asyncio-side
-cancellation alone does not actually stop the interleaving in the case
-that matters most. What actually stops it is
-``PipelineBridge``'s own generation-fencing (see ``pipeline_bridge.py``'s
-module docstring): ``drive_with_text`` passes a per-call proxy instead of
-the real ``avatar_session``, and ``interrupt()`` (called by
-``_supersede_in_flight_response`` above) invalidates that proxy's
-generation, turning every ``put_msg_txt`` call an orphaned, still-running
-``llm_response`` invocation tries to make afterward into a silent no-op —
-regardless of which stage its task had reached. The asyncio-level
-cancellation kept here is still worth doing (it is correct for the stage-1
-case, and avoids wasting executor capacity starting a call that would
-immediately no-op anyway) — it just is not, on its own, what makes
-superseding actually work.
+What actually stops an older ``llm_response`` call that is still
+streaming in its executor thread is ``PipelineBridge``'s generation fence
+(``pipeline_bridge.py`` module docstring): ``interrupt()`` invalidates that
+call's generation, so every ``put_msg_txt`` it makes afterward is a silent
+no-op. Cancelling its asyncio task could not do this — the executor
+thread has no cancellation checkpoint — which is why the commit path does
+not cancel other tasks at all (it also must not cancel itself, nor a
+*newer* utterance still in ASR). ``_cancel_pending_drive_tasks`` is still
+used on a confirmed barge-in (every pending task is older than the speech
+that triggered it) and on teardown.
 
 The job does not end on its own — ``ctx.shutdown()`` must be called (code review finding)
 ---------------------------------------------------------------------------------------------
@@ -294,14 +287,15 @@ wrapped in ``try/except Exception`` for its ordinary-failure case, but
 nothing afterward depends on it succeeding (or, now, on it even being
 reached) any more.
 
-What is verified vs. not — see the Task 8 report
----------------------------------------------------
+What is verified vs. not
+------------------------
 Everything above was checked against real installed SDK/package source
-(citations inline and in the report). Live end-to-end behavior against a
-real LiveKit dev server + client, and the runtime behavior of
-``JobExecutorType.PROCESS`` on Linux, were **not** exercised in this
-environment — see ``livekit_bridge/worker_app.py``'s module docstring and
-the Task 8 report for what a human must still verify before shipping.
+(citations inline). Live end-to-end behavior against a real LiveKit dev
+server + client, and the runtime behavior of ``JobExecutorType.PROCESS``
+on Linux, were **not** exercised in this environment. The complete list of
+what a human must still verify or build before shipping — including this
+module's per-track session lifetime and the per-process-only room dedup —
+is the "Known limitations" checklist in ``livekit_bridge/__init__.py``.
 """
 
 from __future__ import annotations
@@ -316,9 +310,10 @@ from livekit.agents import AutoSubscribe, JobContext
 
 from livekit_bridge.asr_bridge import AsrBridge
 from livekit_bridge.audio_format import to_pipeline_format
+from livekit_bridge.barge_in_detector import BargeInDetector
 from livekit_bridge.pipeline_bridge import PipelineBridge
 from livekit_bridge.session_registry import BridgeSessionRegistry
-from livekit_bridge.utterance_buffer import _ENERGY_THRESHOLD, UtteranceBuffer
+from livekit_bridge.utterance_buffer import UtteranceBuffer
 from server.session_manager import session_manager
 from streamout.livekit_output import LiveKitOutput
 
@@ -452,14 +447,61 @@ async def _create_avatar_session(
     return avatar_session
 
 
+class _UtteranceOrder:
+    """Arrival order of completed utterances, so only the newest meaningful
+    one ever takes over the avatar.
+
+    Event-loop-thread only (``_process_frame`` issues, the drive task
+    commits — both on the loop), so it needs no lock. Transcriptions run in
+    the executor and can finish out of order; ``try_commit`` rejects an
+    utterance once a newer one has already committed. See module
+    docstring's "Every meaningful utterance supersedes" section.
+    """
+
+    def __init__(self) -> None:
+        self._last_issued = 0
+        self._last_committed = 0
+
+    def issue(self) -> int:
+        self._last_issued += 1
+        return self._last_issued
+
+    def try_commit(self, seq: int) -> bool:
+        if seq <= self._last_committed:
+            return False
+        self._last_committed = seq
+        return True
+
+
 async def _drive_avatar_with_transcription(
     loop: asyncio.AbstractEventLoop,
     asr_bridge: AsrBridge,
     pipeline_bridge: PipelineBridge,
     avatar_session,
     audio: np.ndarray,
+    *,
+    utterance_order: _UtteranceOrder,
+    seq: int,
 ) -> None:
-    """Transcribe one completed utterance and drive the avatar with it.
+    """Transcribe one completed utterance and, if it is meaningful and still
+    the newest, supersede whatever the avatar is doing and drive it with
+    this utterance.
+
+    Supersede happens here, after ASR, not when the utterance completes:
+    only once the (marker-filtered, ``asr_bridge.py``) text is known can we
+    tell a real utterance from a cough, and a noise-only utterance must not
+    cut off the answer that is currently playing. It is unconditional for
+    every meaningful, newest utterance — not gated on a previous drive task
+    still running — because ``llm_response`` returns as soon as it has
+    enqueued its sentences, long before they finish playing (module
+    docstring, "Every meaningful utterance supersedes").
+
+    ``utterance_buffer`` is deliberately *not* reset on this path. By the
+    time ASR returns, the buffer holds only audio that arrived *after* this
+    utterance completed — ``UtteranceBuffer.feed`` already reset itself when
+    it emitted this one — i.e. the start of the user's next utterance, not
+    stale audio. Resetting it here would chop that next utterance's
+    beginning off.
 
     Both steps are deliberately synchronous/blocking (``asr_bridge.py``,
     ``pipeline_bridge.py`` docstrings) — offloaded here via
@@ -480,9 +522,19 @@ async def _drive_avatar_with_transcription(
     runs on this thread (via ``_supersede_in_flight_response``), so the two
     are totally ordered: an interrupt that lands after this dispatch always
     invalidates it, even if the worker has not started running yet. See
-    ``pipeline_bridge.py``'s module docstring, "Round 4", Gap 2.
+    ``pipeline_bridge.py``'s module docstring, "Round 4", Gap 2. The
+    supersede and the allocation run back to back with no ``await``
+    between them, so nothing else on the loop can interleave.
     """
     text = await loop.run_in_executor(None, asr_bridge.transcribe, audio)
+    if not text:
+        # No speech, or non-speech markers only (asr_bridge.py): leave the
+        # current response alone.
+        return
+    if not utterance_order.try_commit(seq):
+        # A newer utterance has already taken over; this one is stale.
+        return
+    _supersede_in_flight_response(pipeline_bridge, avatar_session)
     generation = pipeline_bridge.begin_generation()
     await loop.run_in_executor(
         None, pipeline_bridge.drive_with_text, avatar_session, text, generation
@@ -501,14 +553,14 @@ def _on_drive_task_done(task: "asyncio.Task[None]", pending_tasks: set) -> None:
 def _cancel_pending_drive_tasks(pending_tasks: set) -> None:
     """Cancel and stop tracking every not-yet-finished drive task.
 
-    Can only stop a task that has not yet reached its
-    ``drive_with_text`` call (or is still awaiting the executor for
-    ``transcribe``) — it cannot interrupt a blocking call already
-    executing inside the executor thread. See module docstring's "at most
-    one *tracked* drive task per session" section — actually stopping an
-    already-executing ``llm_response`` call from reaching the real
-    session is ``PipelineBridge``'s job (its generation fencing), not
-    this function's.
+    Used on a confirmed barge-in and on teardown — never from inside a
+    drive task (it would cancel itself). Can only stop a task that has not
+    yet reached its ``drive_with_text`` call (or is still awaiting the
+    executor for ``transcribe``) — it cannot interrupt a blocking call
+    already executing inside the executor thread. Actually stopping an
+    already-executing ``llm_response`` call from reaching the real session
+    is ``PipelineBridge``'s job (its generation fencing), not this
+    function's.
     """
     for task in list(pending_tasks):
         if not task.done():
@@ -516,27 +568,24 @@ def _cancel_pending_drive_tasks(pending_tasks: set) -> None:
         pending_tasks.discard(task)
 
 
-def _supersede_in_flight_response(
-    pipeline_bridge: PipelineBridge, avatar_session, pending_tasks: set
-) -> None:
-    """Stop whatever response is currently being generated/played for a
-    previous utterance, because the user's latest utterance supersedes it.
+def _supersede_in_flight_response(pipeline_bridge: PipelineBridge, avatar_session) -> None:
+    """Stop whatever the avatar is generating or playing for a previous
+    utterance.
 
-    Shared by both trigger points that mean the same thing from this
-    connection shell's point of view: a mid-speech barge-in
-    (``avatar_session.is_speaking()`` was true when new speech started),
-    and a new utterance completing while a previous one's drive task is
-    still running (``pending_tasks`` still holds an unfinished one). See
-    module docstring's "at most one *tracked* drive task per session"
-    section for why the second case is treated the same as the first
-    rather than queued, and for why cancelling the pending task here is
-    necessary but not sufficient — ``pipeline_bridge.interrupt()`` is what
-    actually stops an already-executing ``llm_response`` call from
-    reaching the real session, via ``PipelineBridge``'s own generation
-    fencing (``pipeline_bridge.py``'s module docstring).
+    Shared by both trigger points: a confirmed barge-in (``_process_frame``)
+    and a new meaningful utterance committing
+    (``_drive_avatar_with_transcription``). ``pipeline_bridge.interrupt()``
+    bumps the generation fence — so an ``llm_response`` call still running
+    in an executor thread can no longer reach the real session — and calls
+    ``flush_talk()``; ``clear_queue()`` drops LiveKit ``AudioSource``'s own
+    backlog, which ``flush_talk()`` cannot reach. Both are safe when nothing
+    is playing: ``flush_talk()`` only clears already-empty queues and sets
+    the TTS state to PAUSE, which ``BaseTTS.process_tts`` sets back to
+    RUNNING on the next message it dequeues (``avatars/base_avatar.py:221-227``,
+    ``tts/base_tts.py:30-32,42-46``); ``clear_queue()`` just calls
+    ``AudioSource.clear_queue()`` (``streamout/livekit_output.py:136-151``).
     """
     pipeline_bridge.interrupt(avatar_session)
-    _cancel_pending_drive_tasks(pending_tasks)
     output = getattr(avatar_session, "output", None)
     clear_queue = getattr(output, "clear_queue", None)
     if clear_queue is not None:
@@ -546,63 +595,65 @@ def _supersede_in_flight_response(
 async def _process_frame(
     chunk: np.ndarray,
     *,
-    was_speech: bool,
+    barge_in_detector: BargeInDetector,
     utterance_buffer: UtteranceBuffer,
+    utterance_order: _UtteranceOrder,
     asr_bridge: AsrBridge,
     pipeline_bridge: PipelineBridge,
     avatar_session,
     loop: asyncio.AbstractEventLoop,
     pending_tasks: set,
-) -> bool:
+) -> None:
     """Process one already-format-converted 20ms audio chunk.
 
-    Returns the new ``was_speech`` state for the caller to carry into the
-    next call. Factored out of ``entrypoint``'s main loop so it is
-    unit-testable with a mocked ``avatar_session``/bridges/buffer and no
-    real LiveKit connection at all.
+    Factored out of ``entrypoint``'s main loop so it is unit-testable with a
+    mocked ``avatar_session``/bridges/buffer and no real LiveKit connection
+    at all.
+
+    Barge-in: fires once ``barge_in_detector`` has seen ``min_speech_ms`` of
+    consecutive above-threshold frames *and* the avatar is speaking at that
+    moment (module docstring, "Interrupt-handling design"). It supersedes
+    the current response, cancels every pending drive task, and resets
+    ``utterance_buffer`` to drop stale audio — then puts the run's earlier
+    frames back, since those are the start of the new speech. (Replaying at
+    most 11 speech frames cannot hit ``UtteranceBuffer``'s 30s cap, so the
+    replayed ``feed`` calls always return ``None``.)
 
     On a completed utterance, the transcribe-then-drive sequence is
     scheduled as a tracked background task (added to ``pending_tasks``, a
     set owned by the caller so the task is never garbage-collected
     mid-flight and so ``entrypoint``'s ``finally`` block can cancel any
     still-pending ones) rather than awaited here — see module docstring's
-    "frame-iteration loop must not stall" section for why. At most one such
-    *task* is ever left tracked: if a previous one has not finished by the
-    time a new utterance completes, it is superseded first (cancelled, and
-    — the part that actually stops it from reaching the real session even
-    if it had already started calling the LLM — its
-    ``PipelineBridge``-issued proxy invalidated) — see module docstring's
-    "at most one *tracked* drive task per session" section.
+    "frame-iteration loop must not stall" section. Supersession of the
+    previous response happens inside that task, after ASR, for every
+    meaningful utterance — see ``_drive_avatar_with_transcription``.
     """
     if chunk.size == 0:
-        return was_speech
+        return
 
-    is_speech = float(np.abs(chunk).mean()) > _ENERGY_THRESHOLD
-    if is_speech and not was_speech and avatar_session.is_speaking():
-        # Barge-in: the user started talking again while the avatar was
-        # still talking. See module docstring's "Interrupt-handling design"
-        # section for why this is gated on is_speaking() rather than firing
-        # unconditionally.
-        _supersede_in_flight_response(pipeline_bridge, avatar_session, pending_tasks)
+    confirmed_run = barge_in_detector.feed(chunk)
+    if confirmed_run is not None and avatar_session.is_speaking():
+        _supersede_in_flight_response(pipeline_bridge, avatar_session)
+        _cancel_pending_drive_tasks(pending_tasks)
         utterance_buffer.reset()
+        for earlier_chunk in confirmed_run[:-1]:
+            utterance_buffer.feed(earlier_chunk)
 
     completed_utterance = utterance_buffer.feed(chunk)
     if completed_utterance is not None:
-        if any(not task.done() for task in pending_tasks):
-            # A previous utterance's response is still being generated —
-            # treat this new one as superseding it rather than queueing
-            # behind it.
-            _supersede_in_flight_response(pipeline_bridge, avatar_session, pending_tasks)
-
         task = loop.create_task(
             _drive_avatar_with_transcription(
-                loop, asr_bridge, pipeline_bridge, avatar_session, completed_utterance
+                loop,
+                asr_bridge,
+                pipeline_bridge,
+                avatar_session,
+                completed_utterance,
+                utterance_order=utterance_order,
+                seq=utterance_order.issue(),
             )
         )
         pending_tasks.add(task)
         task.add_done_callback(lambda t: _on_drive_task_done(t, pending_tasks))
-
-    return is_speech
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -610,7 +661,18 @@ async def entrypoint(ctx: JobContext) -> None:
 
     One job == one LiveKit room == (at most) one LiveTalking avatar session,
     deduplicated across concurrent/retried dispatches for the same room by
-    ``_registry`` (Task 7).
+    ``_registry`` — but only among jobs running in *this* worker process.
+    ``BridgeSessionRegistry`` is in-process memory, so a retried dispatch
+    that lands on a different worker process or host (multi-worker
+    deployment, or after a restart) is not caught and can create a
+    duplicate session; see ``BridgeSessionRegistry``'s docstring for what a
+    multi-worker deployment needs instead.
+
+    The session's lifetime is tied to the first subscribed audio track's
+    stream: when that stream ends (including on a client reconnect or a
+    mic unpublish/republish) the session is torn down and the job shuts
+    down, with no relink. A deliberate deferral — see
+    ``livekit_bridge/__init__.py``'s "Known limitations".
     """
     room_name = _room_name_from_job(ctx)
     if not _registry.acquire(room_name):
@@ -619,6 +681,9 @@ async def entrypoint(ctx: JobContext) -> None:
             "skipping duplicate dispatch",
             room_name,
         )
+        # Per-process check only: a duplicate dispatch landing on another
+        # worker process/host is not detected here (BridgeSessionRegistry
+        # docstring).
         # The room is never connected on this path, so nothing will ever
         # resolve the framework's shutdown future on its own (see module
         # docstring's "the job does not end on its own" section) — without
@@ -651,6 +716,8 @@ async def entrypoint(ctx: JobContext) -> None:
         pipeline_bridge = PipelineBridge()
         asr_bridge = AsrBridge()
         utterance_buffer = UtteranceBuffer(silence_threshold_ms=500)
+        barge_in_detector = BargeInDetector()
+        utterance_order = _UtteranceOrder()
 
         try:
             track = await asyncio.wait_for(track_future, timeout=_TRACK_WAIT_TIMEOUT_S)
@@ -664,17 +731,17 @@ async def entrypoint(ctx: JobContext) -> None:
 
         audio_stream = _make_audio_stream(track)
 
-        was_speech = False
         async for frame_event in audio_stream:
             # frame_event.frame.data is a memoryview cast to native int16
             # (format_probe.py Fact 1) — np.frombuffer (inside
             # to_pipeline_format) accepts any buffer-protocol object, not
             # just bytes, so no extra copy/conversion is needed here.
             chunk = to_pipeline_format(frame_event.frame.data)
-            was_speech = await _process_frame(
+            await _process_frame(
                 chunk,
-                was_speech=was_speech,
+                barge_in_detector=barge_in_detector,
                 utterance_buffer=utterance_buffer,
+                utterance_order=utterance_order,
                 asr_bridge=asr_bridge,
                 pipeline_bridge=pipeline_bridge,
                 avatar_session=avatar_session,
@@ -717,7 +784,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # but calling remove_session unconditionally here at least reclaims
         # the dict entry instead of leaking it.
         session_manager.remove_session(room_name)
-        # Released next (not first, unlike the brief's draft ordering): a
+        # Released next (not first, unlike the plan's draft ordering): a
         # session for this room is still being torn down until this line, so
         # releasing the registry after tearing it down — rather than before —
         # shrinks (though, since remove_session is fire-and-forget with

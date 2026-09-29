@@ -1,22 +1,27 @@
 """
 Tests for livekit_bridge.entrypoint.
 
-Task 8 is an integration task wiring together Tasks 2-7 plus a real,
+entrypoint.py wires the other livekit_bridge components to a real,
 external LiveKit connection — there is no local LiveKit dev server or test
-client available in this environment (see the Task 8 report), so nothing
-here talks to a real `rtc.Room`/`JobContext`. What *is* genuinely
-unit-testable without live infrastructure, and is covered below:
+client available in this environment (see livekit_bridge/__init__.py's
+"Known limitations"), so nothing here talks to a real
+`rtc.Room`/`JobContext`. What *is* genuinely unit-testable without live
+infrastructure, and is covered below:
 
 - the small helper functions entrypoint() is built from, each verified
   against the real installed livekit/livekit-agents API it wraps (see
   entrypoint.py's module docstring for citations) — with everything from
   the real SDK that would require a live connection replaced by a minimal
   fake/mock;
-- the interrupt-detection gating logic in `_process_frame`, including the
-  case the brief's "unconditional" suggestion would have gotten wrong
-  (a mid-utterance energy dip while the avatar is NOT speaking), and that a
-  detected barge-in also clears LiveKitOutput's own queued audio (code
-  review C2);
+- the barge-in logic in `_process_frame`: it needs 240ms of sustained
+  speech (a single noise frame or a short burst does not interrupt), only
+  fires while the avatar is speaking, fires once per run, clears
+  LiveKitOutput's own queued audio (code review C2), and keeps the new
+  speech's first frames when it resets the buffer;
+- that every meaningful utterance supersedes the previous response — even
+  once that response's llm_response call has returned — while a
+  noise-only (filtered-to-empty) utterance does not, and an older utterance
+  whose ASR finishes last is dropped;
 - that the two documented-blocking calls (`asr_bridge.transcribe`,
   `pipeline_bridge.drive_with_text`) are actually executed off the calling
   thread via `run_in_executor`, not merely moved around, and that they are
@@ -29,23 +34,14 @@ unit-testable without live infrastructure, and is covered below:
   audio track ever arrived" timeout path, and even when `aclose()` itself
   raises (code review I2/I3); and that the duplicate-dispatch early return
   also calls `ctx.shutdown()` (code review I2);
-- that at most one *tracked* `drive_with_text`-driving task is ever left
-  in `pending_tasks` per session: a new utterance completing while a
-  previous one's response is still being generated supersedes it (cancels
-  the stale task, calls `pipeline_bridge.interrupt()`) rather than letting
-  both run concurrently (code review follow-up finding to I1). What this
-  file does *not* prove on its own — because it genuinely cannot, without
-  reaching into `PipelineBridge`'s own generation-fencing — is that an
-  already-executing `llm_response` call (the case where cancelling the
-  asyncio task has no effect, since that call is running in its own
-  executor thread with no cancellation checkpoint) is actually stopped
-  from reaching the real session; that guarantee is tested directly in
-  `test_pipeline_bridge.py` instead (see its
-  `test_superseded_call_cannot_reach_real_session_after_new_drive_call`).
+- that an already-executing `llm_response` call is stopped from reaching
+  the real session once superseded: covered end to end here with the real
+  `PipelineBridge` (`test_new_utterance_cuts_off_already_enqueued_answer_end_to_end`,
+  `test_interrupt_between_dispatch_and_worker_start_fences_the_real_bridge`),
+  and the fence itself, with real threads, in `test_pipeline_bridge.py`.
 """
 
 import asyncio
-import contextlib
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,6 +51,7 @@ import pytest
 from livekit import rtc
 
 from livekit_bridge import entrypoint as ep
+from livekit_bridge.barge_in_detector import BargeInDetector
 from livekit_bridge.session_registry import BridgeSessionRegistry
 from streamout.livekit_output import LiveKitOutput
 
@@ -214,173 +211,166 @@ async def test_create_avatar_session_wires_output_and_starts_render_thread():
     fake_thread.start.assert_called_once()
 
 
-# ─── _process_frame: interrupt-detection gating ─────────────────────────
+# ─── _process_frame: barge-in detection ─────────────────────────────────
+
+# BargeInDetector's default: 240ms of consecutive above-threshold 20ms frames.
+_BARGE_IN_FRAMES = 12
 
 
-@pytest.mark.asyncio
-async def test_process_frame_no_interrupt_when_avatar_not_speaking():
-    # A silence->speech transition while the avatar is NOT talking must not
-    # fire interrupt()/reset() — this is the exact case the brief's
-    # "unconditional" fallback would have mishandled if it had also
-    # unconditionally reset the buffer (see entrypoint.py module docstring's
-    # "Interrupt-handling design" section).
+def _frame_kwargs(**overrides):
     avatar_session = MagicMock()
     avatar_session.is_speaking.return_value = False
-    pipeline_bridge = MagicMock()
     utterance_buffer = MagicMock()
     utterance_buffer.feed.return_value = None
-    asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
-
-    was_speech = await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=False,
+    kwargs = dict(
+        barge_in_detector=BargeInDetector(),
         utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
+        utterance_order=ep._UtteranceOrder(),
+        asr_bridge=MagicMock(),
+        pipeline_bridge=MagicMock(),
         avatar_session=avatar_session,
-        loop=loop,
+        loop=asyncio.get_running_loop(),
         pending_tasks=set(),
     )
+    kwargs.update(overrides)
+    return kwargs
 
-    assert was_speech is True
-    pipeline_bridge.interrupt.assert_not_called()
-    utterance_buffer.reset.assert_not_called()
-    utterance_buffer.feed.assert_called_once()
+
+async def _feed_frames(chunks, kwargs):
+    for chunk in chunks:
+        await ep._process_frame(chunk, **kwargs)
 
 
 @pytest.mark.asyncio
-async def test_process_frame_interrupts_on_barge_in_while_avatar_speaking():
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = True
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = None
-    asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
+async def test_process_frame_single_noise_frame_does_not_barge_in():
+    # Final-review finding: one 20ms frame above the threshold (a click, a
+    # cough onset) while the avatar is speaking must not interrupt it.
+    kwargs = _frame_kwargs()
+    kwargs["avatar_session"].is_speaking.return_value = True
 
-    was_speech = await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=set(),
-    )
+    await _feed_frames([_make_chunk(is_speech=True), _make_chunk(is_speech=False)], kwargs)
 
-    assert was_speech is True
-    pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
-    utterance_buffer.reset.assert_called_once()
+    kwargs["pipeline_bridge"].interrupt.assert_not_called()
+    kwargs["utterance_buffer"].reset.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_process_frame_clears_output_queue_on_barge_in():
-    # Code review C2: flush_talk() cannot reach LiveKit's own queued audio.
-    # A detected barge-in must also call avatar_session.output.clear_queue()
-    # when the current output exposes one.
-    avatar_session = MagicMock()
+async def test_process_frame_burst_shorter_than_threshold_does_not_barge_in():
+    kwargs = _frame_kwargs()
+    kwargs["avatar_session"].is_speaking.return_value = True
+
+    burst = [_make_chunk(is_speech=True)] * (_BARGE_IN_FRAMES - 1)
+    await _feed_frames(burst + [_make_chunk(is_speech=False)] + burst, kwargs)
+
+    kwargs["pipeline_bridge"].interrupt.assert_not_called()
+    kwargs["utterance_buffer"].reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_frame_sustained_speech_barges_in_once_while_avatar_speaking():
+    kwargs = _frame_kwargs()
+    avatar_session = kwargs["avatar_session"]
     avatar_session.is_speaking.return_value = True
     avatar_session.output = MagicMock(spec=LiveKitOutput)
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = None
-    asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
+    stale_task = MagicMock()
+    stale_task.done.return_value = False
+    kwargs["pending_tasks"].add(stale_task)
 
-    await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=set(),
-    )
+    speech = [_make_chunk(is_speech=True)] * _BARGE_IN_FRAMES
+    await _feed_frames(speech[:-1], kwargs)
+    kwargs["pipeline_bridge"].interrupt.assert_not_called()
 
+    await _feed_frames(speech[-1:], kwargs)
+    kwargs["pipeline_bridge"].interrupt.assert_called_once_with(avatar_session)
     avatar_session.output.clear_queue.assert_called_once()
+    kwargs["utterance_buffer"].reset.assert_called_once()
+    stale_task.cancel.assert_called_once()
+    assert kwargs["pending_tasks"] == set()
+
+    # Speech continuing past the threshold is the same run: no re-fire.
+    await _feed_frames([_make_chunk(is_speech=True)] * 30, kwargs)
+    kwargs["pipeline_bridge"].interrupt.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_frame_new_run_after_silence_can_barge_in_again():
+    kwargs = _frame_kwargs()
+    kwargs["avatar_session"].is_speaking.return_value = True
+    run = [_make_chunk(is_speech=True)] * _BARGE_IN_FRAMES
+
+    await _feed_frames(run + [_make_chunk(is_speech=False)] + run, kwargs)
+
+    assert kwargs["pipeline_bridge"].interrupt.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_process_frame_no_barge_in_when_avatar_not_speaking():
+    # Sustained speech while the avatar is NOT talking must not
+    # interrupt/reset — see entrypoint.py's "Interrupt-handling design".
+    kwargs = _frame_kwargs()
+
+    await _feed_frames([_make_chunk(is_speech=True)] * (_BARGE_IN_FRAMES + 5), kwargs)
+
+    kwargs["pipeline_bridge"].interrupt.assert_not_called()
+    kwargs["utterance_buffer"].reset.assert_not_called()
+    assert kwargs["utterance_buffer"].feed.call_count == _BARGE_IN_FRAMES + 5
 
 
 @pytest.mark.asyncio
 async def test_process_frame_barge_in_survives_output_without_clear_queue():
     # Other outputs (webrtc/rtmp/virtualcam) do not implement clear_queue()
     # at all — the hasattr-style guard must not raise for them.
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = True
-    avatar_session.output = object()  # deliberately has no clear_queue
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = None
-    asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
+    kwargs = _frame_kwargs()
+    kwargs["avatar_session"].is_speaking.return_value = True
+    kwargs["avatar_session"].output = object()  # deliberately has no clear_queue
 
-    # Must not raise.
-    await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=set(),
-    )
+    await _feed_frames([_make_chunk(is_speech=True)] * _BARGE_IN_FRAMES, kwargs)
 
-    pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
+    kwargs["pipeline_bridge"].interrupt.assert_called_once_with(kwargs["avatar_session"])
 
 
 @pytest.mark.asyncio
-async def test_process_frame_no_interrupt_without_silence_to_speech_transition():
-    # Already speaking on the previous chunk -> no rising edge -> no
-    # interrupt, even though the avatar is "speaking". Guards against a
-    # naive per-chunk (not edge-triggered) implementation.
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = True
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = None
+async def test_process_frame_barge_in_keeps_the_new_speech_and_drops_stale_audio():
+    # On a confirmed barge-in the buffer is reset to drop audio from before
+    # the onset, and the run's earlier frames are fed back in — otherwise
+    # the reset would cut the first 220ms off the very speech that
+    # triggered it. Uses the real UtteranceBuffer.
+    from livekit_bridge.utterance_buffer import UtteranceBuffer
+
+    captured = []
+
+    def capture_transcribe(audio):
+        captured.append(audio)
+        return ""
+
     asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
+    asr_bridge.transcribe.side_effect = capture_transcribe
+    kwargs = _frame_kwargs(utterance_buffer=UtteranceBuffer(silence_threshold_ms=500), asr_bridge=asr_bridge)
+    kwargs["avatar_session"].is_speaking.return_value = True
 
-    await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=True,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=set(),
+    stale = np.full(320, 0.9, dtype=np.float32)
+    new_speech = np.full(320, 0.3, dtype=np.float32)
+    frames = [stale] * 3 + [_make_chunk(is_speech=False)] * 2  # stale partial, not ended
+    frames += [new_speech] * (_BARGE_IN_FRAMES + 3)
+    await _feed_frames(frames, kwargs)
+    kwargs["avatar_session"].is_speaking.return_value = False
+    await _feed_frames([_make_chunk(is_speech=False)] * 25, kwargs)
+    await asyncio.gather(*kwargs["pending_tasks"])
+
+    assert len(captured) == 1
+    np.testing.assert_array_equal(
+        captured[0], np.concatenate([new_speech] * (_BARGE_IN_FRAMES + 3))
     )
-
-    pipeline_bridge.interrupt.assert_not_called()
-    utterance_buffer.reset.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_process_frame_empty_chunk_is_noop():
-    avatar_session = MagicMock()
-    utterance_buffer = MagicMock()
-    pipeline_bridge = MagicMock()
-    asr_bridge = MagicMock()
-    loop = asyncio.get_running_loop()
+    kwargs = _frame_kwargs()
 
-    was_speech = await ep._process_frame(
-        np.zeros(0, dtype=np.float32),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=set(),
-    )
+    await ep._process_frame(np.zeros(0, dtype=np.float32), **kwargs)
 
-    assert was_speech is False
-    utterance_buffer.feed.assert_not_called()
-    avatar_session.is_speaking.assert_not_called()
+    kwargs["utterance_buffer"].feed.assert_not_called()
+    kwargs["avatar_session"].is_speaking.assert_not_called()
 
 
 # ─── _process_frame: executor offloading + background scheduling ───────
@@ -402,64 +392,35 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
     def fake_drive_with_text(avatar_session, text, generation):
         call_threads["drive_with_text"] = threading.get_ident()
 
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = False
-    asr_bridge = MagicMock()
-    asr_bridge.transcribe.side_effect = fake_transcribe
-    pipeline_bridge = MagicMock()
-    pipeline_bridge.begin_generation.return_value = 7
-    pipeline_bridge.drive_with_text.side_effect = fake_drive_with_text
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
-    loop = asyncio.get_running_loop()
-    pending_tasks: set = set()
+    kwargs = _frame_kwargs()
+    kwargs["asr_bridge"].transcribe.side_effect = fake_transcribe
+    kwargs["pipeline_bridge"].begin_generation.return_value = 7
+    kwargs["pipeline_bridge"].drive_with_text.side_effect = fake_drive_with_text
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
 
-    await ep._process_frame(
-        _make_chunk(is_speech=False),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=pending_tasks,
-    )
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
 
-    # The drive-with-transcription sequence is now a scheduled background
-    # task (code review I1), not awaited inline — give it a moment to run.
-    assert len(pending_tasks) == 1
-    await asyncio.gather(*pending_tasks)
+    # The drive-with-transcription sequence is a scheduled background task
+    # (code review I1), not awaited inline — give it a moment to run.
+    assert len(kwargs["pending_tasks"]) == 1
+    await asyncio.gather(*kwargs["pending_tasks"])
 
     assert call_threads.get("transcribe") not in (None, main_thread_id)
     assert call_threads.get("drive_with_text") not in (None, main_thread_id)
-    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "hello", 7)
+    kwargs["pipeline_bridge"].drive_with_text.assert_called_once_with(
+        kwargs["avatar_session"], "hello", 7
+    )
 
 
 @pytest.mark.asyncio
 async def test_process_frame_skips_asr_when_no_utterance_completed():
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = False
-    asr_bridge = MagicMock()
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = None
-    loop = asyncio.get_running_loop()
-    pending_tasks: set = set()
+    kwargs = _frame_kwargs()
 
-    await ep._process_frame(
-        _make_chunk(is_speech=True),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=pending_tasks,
-    )
+    await ep._process_frame(_make_chunk(is_speech=True), **kwargs)
 
-    assert pending_tasks == set()
-    asr_bridge.transcribe.assert_not_called()
-    pipeline_bridge.drive_with_text.assert_not_called()
+    assert kwargs["pending_tasks"] == set()
+    kwargs["asr_bridge"].transcribe.assert_not_called()
+    kwargs["pipeline_bridge"].drive_with_text.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -476,136 +437,183 @@ async def test_process_frame_does_not_block_caller_on_a_slow_drive_call():
         time.sleep(0.3)
         return "text"
 
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = False
-    asr_bridge = MagicMock()
-    asr_bridge.transcribe.side_effect = slow_transcribe
-    pipeline_bridge = MagicMock()
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
-    loop = asyncio.get_running_loop()
-    pending_tasks: set = set()
+    kwargs = _frame_kwargs()
+    kwargs["asr_bridge"].transcribe.side_effect = slow_transcribe
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
+    loop = kwargs["loop"]
 
     call_started_at = loop.time()
-    await ep._process_frame(
-        _make_chunk(is_speech=False),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=pending_tasks,
-    )
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
     elapsed = loop.time() - call_started_at
 
     # _process_frame itself must return almost immediately: the transcribe
     # call (which sleeps for 0.3s) runs in a background task, not awaited
     # here — this call returning well under that proves it.
     assert elapsed < 0.15
-    assert len(pending_tasks) == 1
+    assert len(kwargs["pending_tasks"]) == 1
 
-    await asyncio.gather(*pending_tasks)
+    await asyncio.gather(*kwargs["pending_tasks"])
+
+
+# ─── _process_frame: every meaningful utterance supersedes ──────────────
+
+
+def _ordered_mocks():
+    """pipeline_bridge and avatar_session.output as children of one parent
+    mock, so the relative order of their calls can be asserted."""
+    parent = MagicMock()
+    avatar_session = MagicMock()
+    avatar_session.is_speaking.return_value = False
+    avatar_session.output = parent.output
+    return parent, parent.pipeline_bridge, avatar_session
 
 
 @pytest.mark.asyncio
-async def test_process_frame_supersedes_stale_drive_task_on_new_utterance():
-    # Code review follow-up to I1: scheduling every completed utterance as
-    # an independent background task let two drive_with_text calls run
-    # concurrently with no ordering, interleaving their TTS output. A new
-    # utterance completing while a previous one's response is still being
-    # generated must supersede it (cancel the stale task + interrupt the
-    # avatar + clear the output queue), not queue behind it — see
-    # entrypoint.py's module docstring's "at most one *tracked* drive task
-    # per session" section for why supersede was chosen over queueing.
-    #
-    # This test only exercises the case where the stale task is still
-    # awaiting transcribe() (stage 1) when superseded — cancellation alone
-    # is sufficient there, since the coroutine never resumes to reach
-    # drive_with_text. It deliberately does NOT prove the harder case (a
-    # stale task already executing llm_response in its own executor
-    # thread, where cancelling the asyncio task has no effect) is handled
-    # — that guarantee comes from PipelineBridge's own generation fencing,
-    # not from anything in this module, and is proven directly in
-    # test_pipeline_bridge.py's
-    # test_superseded_call_cannot_reach_real_session_after_new_drive_call.
-    avatar_session = MagicMock()
-    avatar_session.is_speaking.return_value = False
-    avatar_session.output = MagicMock(spec=LiveKitOutput)
-    pipeline_bridge = MagicMock()
-    pipeline_bridge.begin_generation.return_value = 2
-    utterance_buffer = MagicMock()
-    utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
-    loop = asyncio.get_running_loop()
-    pending_tasks: set = set()
+async def test_meaningful_utterance_supersedes_even_after_previous_drive_task_finished():
+    # Final-review finding: llm_response returns as soon as it has enqueued
+    # its sentences, so the previous utterance's drive task is done() while
+    # its answer is still playing. The next meaningful utterance must still
+    # interrupt it, not queue behind it.
+    parent, pipeline_bridge, avatar_session = _ordered_mocks()
+    pipeline_bridge.begin_generation.side_effect = [1, 2]
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.side_effect = ["first", "second"]
+    kwargs = _frame_kwargs(
+        pipeline_bridge=pipeline_bridge, avatar_session=avatar_session, asr_bridge=asr_bridge
+    )
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
 
-    # The first utterance's transcribe() blocks (in a real executor thread)
-    # until the test releases it, simulating a response that is still being
-    # generated when the second utterance completes.
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    await asyncio.gather(*kwargs["pending_tasks"])
+    assert kwargs["pending_tasks"] == set()  # nothing "in flight" any more
+
+    parent.reset_mock()
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    await asyncio.gather(*kwargs["pending_tasks"])
+
+    # interrupt + clear_queue, then a fresh generation, then the drive — in
+    # that order.
+    assert [c[0] for c in parent.mock_calls] == [
+        "pipeline_bridge.interrupt",
+        "output.clear_queue",
+        "pipeline_bridge.begin_generation",
+        "pipeline_bridge.drive_with_text",
+    ]
+    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "second", 2)
+
+
+@pytest.mark.asyncio
+async def test_noise_only_utterance_does_not_interrupt_current_response():
+    # AsrBridge returns "" for no speech and for SenseVoice's non-speech
+    # markers (a cough -> "😷"); such an utterance must leave the answer
+    # that is currently playing alone.
+    kwargs = _frame_kwargs()
+    kwargs["avatar_session"].output = MagicMock(spec=LiveKitOutput)
+    kwargs["asr_bridge"].transcribe.return_value = ""
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
+
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    await asyncio.gather(*kwargs["pending_tasks"])
+
+    kwargs["pipeline_bridge"].interrupt.assert_not_called()
+    kwargs["avatar_session"].output.clear_queue.assert_not_called()
+    kwargs["pipeline_bridge"].begin_generation.assert_not_called()
+    kwargs["pipeline_bridge"].drive_with_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_older_utterance_whose_asr_finishes_last_is_dropped():
+    # Transcriptions run in the executor and can finish out of order. The
+    # newest utterance must win even if an older one's ASR returns later.
     first_call_release = threading.Event()
-    call_count = {"n": 0}
 
-    def blocking_transcribe(audio):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
+    def transcribe(audio):
+        if audio[0] == 1.0:
             first_call_release.wait(timeout=5)
             return "first"
         return "second"
 
-    asr_bridge = MagicMock()
-    asr_bridge.transcribe.side_effect = blocking_transcribe
+    kwargs = _frame_kwargs()
+    kwargs["asr_bridge"].transcribe.side_effect = transcribe
+    kwargs["pipeline_bridge"].begin_generation.return_value = 5
 
-    await ep._process_frame(
-        _make_chunk(is_speech=False),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=pending_tasks,
-    )
-    await asyncio.sleep(0.05)  # let the task actually start running transcribe
-    assert len(pending_tasks) == 1
-    first_task = next(iter(pending_tasks))
-    assert not first_task.done()
+    kwargs["utterance_buffer"].feed.return_value = np.ones(320, dtype=np.float32)
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    first_task = next(iter(kwargs["pending_tasks"]))
+    await asyncio.sleep(0.05)  # let it start its (blocked) transcribe
 
-    # Second utterance completes while the first is still in flight.
-    await ep._process_frame(
-        _make_chunk(is_speech=False),
-        was_speech=False,
-        utterance_buffer=utterance_buffer,
-        asr_bridge=asr_bridge,
-        pipeline_bridge=pipeline_bridge,
-        avatar_session=avatar_session,
-        loop=loop,
-        pending_tasks=pending_tasks,
-    )
-
-    # The stale task must have had cancellation requested, and the avatar
-    # told to interrupt (flush_talk + clear_queue), before the second task
-    # started — proven by cancelling()/pending state rather than waiting
-    # for the blocked executor thread to actually unwind.
-    assert first_task.cancelling() > 0
-    pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
-    avatar_session.output.clear_queue.assert_called_once()
-    assert len(pending_tasks) == 1
-    second_task = next(iter(pending_tasks))
-    assert second_task is not first_task
-
-    first_call_release.set()  # release the blocked executor thread
-    with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.gather(first_task, return_exceptions=True)
-    assert first_task.cancelled()
-    # The cancelled first task's transcribe result ("first") must never
-    # have reached drive_with_text.
-    pipeline_bridge.drive_with_text.assert_not_called()
-
+    kwargs["utterance_buffer"].feed.return_value = np.full(320, 2.0, dtype=np.float32)
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    second_task = next(t for t in kwargs["pending_tasks"] if t is not first_task)
     await asyncio.gather(second_task)
-    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "second", 2)
-    # Only the task that actually reached the drive stage allocated a
-    # generation; the cancelled one never got that far.
-    pipeline_bridge.begin_generation.assert_called_once_with()
+    kwargs["pipeline_bridge"].drive_with_text.assert_called_once_with(
+        kwargs["avatar_session"], "second", 5
+    )
+
+    first_call_release.set()
+    await asyncio.gather(first_task)
+
+    # "first" finished ASR after "second" had committed: dropped, and it
+    # did not interrupt "second"'s answer either.
+    kwargs["pipeline_bridge"].drive_with_text.assert_called_once()
+    kwargs["pipeline_bridge"].interrupt.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_superseding_does_not_reset_the_utterance_buffer():
+    # By the time an utterance's ASR returns, the buffer holds only audio
+    # that arrived after it completed — the start of the user's *next*
+    # utterance. Resetting it on the supersede path would cut that off.
+    kwargs = _frame_kwargs()
+    kwargs["asr_bridge"].transcribe.return_value = "hello"
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
+
+    await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+    await asyncio.gather(*kwargs["pending_tasks"])
+
+    kwargs["pipeline_bridge"].interrupt.assert_called_once()
+    kwargs["utterance_buffer"].reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_utterance_cuts_off_already_enqueued_answer_end_to_end():
+    # End to end with the real PipelineBridge: the first answer's
+    # llm_response has already returned (both sentences enqueued, task
+    # done). The next utterance must flush it before its own answer is
+    # enqueued.
+    from livekit_bridge.pipeline_bridge import PipelineBridge
+
+    session = MagicMock()
+    session.is_speaking.return_value = False
+    events = []
+    session.put_msg_txt.side_effect = lambda msg, datainfo: events.append(("put", msg))
+    session.flush_talk.side_effect = lambda: events.append(("flush",))
+
+    def fake_llm_response(message, proxy, datainfo):
+        proxy.put_msg_txt(f"{message}-1", {})
+        proxy.put_msg_txt(f"{message}-2", {})
+
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.side_effect = ["a", "b"]
+    kwargs = _frame_kwargs(
+        pipeline_bridge=PipelineBridge(), avatar_session=session, asr_bridge=asr_bridge
+    )
+    kwargs["utterance_buffer"].feed.return_value = np.zeros(320, dtype=np.float32)
+
+    with patch("livekit_bridge.pipeline_bridge.llm_response", side_effect=fake_llm_response):
+        await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+        await asyncio.gather(*kwargs["pending_tasks"])
+        await ep._process_frame(_make_chunk(is_speech=False), **kwargs)
+        await asyncio.gather(*kwargs["pending_tasks"])
+
+    assert events == [
+        ("flush",),
+        ("put", "a-1"),
+        ("put", "a-2"),
+        ("flush",),
+        ("put", "b-1"),
+        ("put", "b-2"),
+    ]
 
 
 # ─── _drive_avatar_with_transcription: generation allocated on the loop ─
@@ -634,12 +642,15 @@ async def test_drive_generation_is_allocated_on_event_loop_before_executor_dispa
     asr_bridge.transcribe.return_value = "hi"
     avatar_session = MagicMock()
 
+    order = ep._UtteranceOrder()
     await ep._drive_avatar_with_transcription(
         asyncio.get_running_loop(),
         asr_bridge,
         pipeline_bridge,
         avatar_session,
         np.zeros(320, dtype=np.float32),
+        utterance_order=order,
+        seq=order.issue(),
     )
 
     assert [name for name, _ in events] == ["begin_generation", "drive_with_text"]
@@ -681,6 +692,7 @@ async def test_interrupt_between_dispatch_and_worker_start_fences_the_real_bridg
     asr_bridge = MagicMock()
     asr_bridge.transcribe.return_value = "hi"
     gated_loop = _DispatchGatedLoop(asyncio.get_running_loop())
+    order = ep._UtteranceOrder()
 
     def fake_llm_response(message, proxy, datainfo):
         proxy.put_msg_txt("fragment from a superseded call", {})
@@ -688,7 +700,13 @@ async def test_interrupt_between_dispatch_and_worker_start_fences_the_real_bridg
     with patch("livekit_bridge.pipeline_bridge.llm_response", side_effect=fake_llm_response):
         drive = asyncio.ensure_future(
             ep._drive_avatar_with_transcription(
-                gated_loop, asr_bridge, bridge, session, np.zeros(320, dtype=np.float32)
+                gated_loop,
+                asr_bridge,
+                bridge,
+                session,
+                np.zeros(320, dtype=np.float32),
+                utterance_order=order,
+                seq=order.issue(),
             )
         )
         await asyncio.wait_for(gated_loop.drive_dispatched.wait(), timeout=5)
@@ -697,7 +715,10 @@ async def test_interrupt_between_dispatch_and_worker_start_fences_the_real_bridg
         gated_loop.release_drive.set()
         await asyncio.wait_for(drive, timeout=5)
 
-    session.flush_talk.assert_called_once()
+    # Twice: once by the drive's own supersede (every meaningful utterance
+    # supersedes, before allocating its generation), once by the test's
+    # interrupt() above.
+    assert session.flush_talk.call_count == 2
     session.put_msg_txt.assert_not_called()
 
 

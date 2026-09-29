@@ -70,9 +70,26 @@ class LiveKitOutput(BaseOutput):
         # capture_frame() is async; run_coroutine_threadsafe schedules it on
         # the room's event loop and returns immediately, so this call does
         # not block the (synchronous) caller.
-        future = asyncio.run_coroutine_threadsafe(
-            self._audio_source.capture_frame(audio_frame), self._loop
-        )
+        capture_coro = self._audio_source.capture_frame(audio_frame)
+        try:
+            future = asyncio.run_coroutine_threadsafe(capture_coro, self._loop)
+        except RuntimeError as exc:
+            # run_coroutine_threadsafe schedules via loop.call_soon_threadsafe(),
+            # which calls self._check_closed() and raises
+            # RuntimeError('Event loop is closed') SYNCHRONOUSLY, before any
+            # scheduling happens (verified in CPython's
+            # asyncio.base_events.BaseEventLoop.call_soon_threadsafe /
+            # _check_closed). This is a realistic race: push_audio_frame runs on
+            # the pipeline's synchronous render thread
+            # (avatars/base_avatar.py's process_frames loop), and a LiveKit
+            # disconnect/shutdown can close self._loop while that thread is
+            # still mid-flight. Drop this frame instead of letting the
+            # RuntimeError propagate into and crash the whole render loop.
+            capture_coro.close()  # avoid a "coroutine was never awaited" warning
+            logger.error(
+                f"LiveKitOutput: audio event loop is closed, dropping frame: {exc}"
+            )
+            return
         future.add_done_callback(self._log_capture_error)
 
         if self.parent:

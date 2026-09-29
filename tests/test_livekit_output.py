@@ -73,3 +73,28 @@ async def test_push_audio_frame_forwards_to_audio_source():
     assert captured.sample_rate == 16000
     assert captured.num_channels == 1
     assert captured.samples_per_channel == 320
+
+
+def test_push_audio_frame_survives_closed_event_loop():
+    """asyncio.run_coroutine_threadsafe() raises RuntimeError('Event loop is
+    closed') SYNCHRONOUSLY (from loop.call_soon_threadsafe -> _check_closed)
+    when the target loop is already closed — this can happen for real if a
+    LiveKit disconnect/shutdown closes the loop while the pipeline's
+    synchronous render thread is still calling push_audio_frame. That
+    RuntimeError must be caught and logged, not propagated into the caller
+    (which would otherwise crash the whole render loop, not just this
+    output). No mocking needed: a real closed event loop reproduces the
+    exact real failure.
+    """
+    fake_source = FakeAudioSource()
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    output = LiveKitOutput(audio_source=fake_source, loop=closed_loop)
+
+    audio_chunk = np.zeros(320, dtype=np.int16)
+    # Must not raise.
+    output.push_audio_frame(audio_chunk, eventpoint=None)
+
+    # The frame is dropped, not queued or retried.
+    assert fake_source.captured_frames == []

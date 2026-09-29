@@ -16,8 +16,10 @@ infrastructure, and is covered below:
 - the barge-in logic in `_process_frame`: it needs 240ms of sustained
   speech (a single noise frame or a short burst does not interrupt), only
   fires while the avatar is speaking, fires once per run, clears
-  LiveKitOutput's own queued audio (code review C2), and keeps the new
-  speech's first frames when it resets the buffer;
+  LiveKitOutput's own queued audio (code review C2), and does NOT reset
+  `utterance_buffer` (an earlier version did, which silently dropped
+  legitimate speech preceding the confirming run — see
+  `test_process_frame_barge_in_keeps_the_new_speech_and_does_not_reset_buffer`);
 - that every meaningful utterance supersedes the previous response — even
   once that response's llm_response call has returned — while a
   noise-only (filtered-to-empty) utterance does not, and an older utterance
@@ -283,7 +285,13 @@ async def test_process_frame_sustained_speech_barges_in_once_while_avatar_speaki
     await _feed_frames(speech[-1:], kwargs)
     kwargs["pipeline_bridge"].interrupt.assert_called_once_with(avatar_session)
     avatar_session.output.clear_queue.assert_called_once()
-    kwargs["utterance_buffer"].reset.assert_called_once()
+    # A confirmed barge-in must NOT reset utterance_buffer: it never holds
+    # genuinely stale audio (UtteranceBuffer._emit already resets on every
+    # real utterance boundary), so resetting here would only ever discard
+    # legitimate speech belonging to the utterance in progress — see
+    # entrypoint.py's _process_frame docstring and
+    # test_process_frame_barge_in_keeps_the_new_speech_and_does_not_reset_buffer.
+    kwargs["utterance_buffer"].reset.assert_not_called()
     stale_task.cancel.assert_called_once()
     assert kwargs["pending_tasks"] == set()
 
@@ -330,11 +338,18 @@ async def test_process_frame_barge_in_survives_output_without_clear_queue():
 
 
 @pytest.mark.asyncio
-async def test_process_frame_barge_in_keeps_the_new_speech_and_drops_stale_audio():
-    # On a confirmed barge-in the buffer is reset to drop audio from before
-    # the onset, and the run's earlier frames are fed back in — otherwise
-    # the reset would cut the first 220ms off the very speech that
-    # triggered it. Uses the real UtteranceBuffer.
+async def test_process_frame_barge_in_keeps_the_new_speech_and_does_not_reset_buffer():
+    # A confirmed barge-in must NOT reset UtteranceBuffer. An earlier
+    # version of this fix reset it and replayed only the confirming run's
+    # own frames back in — which silently dropped any speech that preceded
+    # the run within the same still-open utterance (e.g. a quieter opening
+    # word, or a sub-threshold dip at onset). UtteranceBuffer._emit already
+    # resets on every real utterance boundary (silence_threshold_ms of
+    # silence, or the max_utterance_ms cap), so anything buffered at the
+    # moment of a confirmed barge-in already belongs to the same utterance
+    # the barge-in is part of — there is no "stale" audio to drop. Uses the
+    # real UtteranceBuffer so this is checked against its real semantics,
+    # not a mock's.
     from livekit_bridge.utterance_buffer import UtteranceBuffer
 
     captured = []
@@ -348,10 +363,15 @@ async def test_process_frame_barge_in_keeps_the_new_speech_and_drops_stale_audio
     kwargs = _frame_kwargs(utterance_buffer=UtteranceBuffer(silence_threshold_ms=500), asr_bridge=asr_bridge)
     kwargs["avatar_session"].is_speaking.return_value = True
 
-    stale = np.full(320, 0.9, dtype=np.float32)
-    new_speech = np.full(320, 0.3, dtype=np.float32)
-    frames = [stale] * 3 + [_make_chunk(is_speech=False)] * 2  # stale partial, not ended
-    frames += [new_speech] * (_BARGE_IN_FRAMES + 3)
+    # A quieter opening word, a brief sub-threshold dip (well under the
+    # 500ms silence-threshold that would end an utterance), then the run
+    # that actually confirms the barge-in. All of it belongs to one
+    # utterance by UtteranceBuffer's own segmentation rule.
+    opening_word = np.full(320, 0.2, dtype=np.float32)
+    dip = _make_chunk(is_speech=False)
+    confirming_run = np.full(320, 0.3, dtype=np.float32)
+    frames = [opening_word] * 3 + [dip] * 2
+    frames += [confirming_run] * _BARGE_IN_FRAMES
     await _feed_frames(frames, kwargs)
     kwargs["avatar_session"].is_speaking.return_value = False
     await _feed_frames([_make_chunk(is_speech=False)] * 25, kwargs)
@@ -359,7 +379,8 @@ async def test_process_frame_barge_in_keeps_the_new_speech_and_drops_stale_audio
 
     assert len(captured) == 1
     np.testing.assert_array_equal(
-        captured[0], np.concatenate([new_speech] * (_BARGE_IN_FRAMES + 3))
+        captured[0],
+        np.concatenate([opening_word] * 3 + [confirming_run] * _BARGE_IN_FRAMES),
     )
 
 

@@ -129,17 +129,51 @@ deliberately deferred; none may be assumed to work.
    or the Java backend) or idempotent dispatch on the dispatching side
    (check for an existing dispatch before ``CreateDispatch``).
 
-9. **Deferred: the VAD is an energy threshold, not a speech model.**
-   ``utterance_buffer.py`` and ``barge_in_detector.py`` classify frames by
-   mean absolute amplitude (``_ENERGY_THRESHOLD = 0.05``). This was a
-   deliberate, reviewed choice for this branch, but it cannot tell speech
-   from other loud sound: sustained noise longer than 240ms (a long cough,
-   music) still counts as a barge-in and interrupts the avatar, and the
-   interrupted answer is not replaced because the noise transcribes to a
-   filtered-out marker. Steady noise above the threshold also delays every
-   utterance boundary until the 30s cap. The connection-shell plan (AvatarApp
-   repo, ``docs/superpowers/plans/2026-09-29-livekit-connection-shell.md``,
-   Task 3) already anticipates swapping in LiveKit's Silero VAD
-   (``livekit.plugins.silero``) behind the same ``feed``/``reset``
-   interface; that swap is the deferred follow-up.
+9. **Deferred: the VAD is an energy threshold, not a speech model — this is
+   a real deviation from the master spec, not just an internal choice.**
+   The master design spec (AvatarApp repo,
+   ``docs/superpowers/specs/2026-09-29-app-shell-cloud-integration-design.md``,
+   §6, line 88) specifies detecting a completed utterance "用LiveKit Agents
+   框架自带的语音活动检测/回合检测判断" — i.e. using the LiveKit Agents
+   framework's own VAD/turn-detection. ``utterance_buffer.py`` and
+   ``barge_in_detector.py`` instead classify frames by mean absolute
+   amplitude (``_ENERGY_THRESHOLD = 0.05``). Task 3's plan
+   (``docs/superpowers/plans/2026-09-29-livekit-connection-shell.md``)
+   deferred the spec-named VAD only because a standalone (outside
+   ``AgentSession``), non-``AgentSession``-coupled calling convention for
+   ``livekit-agents``' Silero plugin was unverified at plan-writing time —
+   this is a ruled, disclosed deviation from §6, not a design disagreement
+   with it, and the interface (``feed``/``reset``) was deliberately kept
+   swap-compatible for when that VAD is installed as a follow-up.
+   Concretely, an energy threshold cannot tell speech from other loud
+   sound, which has real, user-visible consequences even after this
+   branch's final-review fixes for the worst cases (SenseVoice-marker
+   filtering, the 240ms barge-in debounce, the 30s utterance cap):
+   - Sustained non-speech noise longer than 240ms (a long cough, music)
+     still counts as a barge-in and interrupts the avatar, and the
+     interrupted answer is not replaced, because that noise's own
+     "utterance" transcribes to a filtered-out marker (item-1's ASR
+     filtering handles the *content*, not the *interruption itself*).
+   - Real speech with any sub-threshold dip inside a 240ms window (a stop
+     closure, a brief pause between syllables) resets the barge-in run
+     count, so a genuine interruption can take longer than 240ms to
+     confirm, or in the worst case never confirm before the avatar
+     finishes talking on its own.
+   - ``BargeInDetector`` fires at most once per run of consecutive
+     above-threshold frames, regardless of whether the avatar happens to be
+     speaking at that instant — a loud run that confirms while the avatar
+     is silent "uses up" that confirmation and will not re-fire later just
+     because the avatar starts a new answer mid-run.
+   - Steady ambient noise above the threshold also delays every utterance
+     boundary until the 30s cap (item 3's fix bounds the *memory* cost of
+     this, not the responsiveness cost).
+   - A separate, accepted consequence of the *design* (not the VAD
+     specifically, but worth naming here since it interacts with it): this
+     branch makes every meaningful new utterance supersede the previous
+     response unconditionally (see ``entrypoint.py``'s "Every meaningful
+     utterance supersedes"), so even a short acknowledgement like "嗯"/"对"
+     said while the avatar is still talking will cut off the current
+     answer and get its own new LLM reply — this is the intended "most
+     recent utterance wins" policy working as designed, not a VAD defect,
+     but a human reviewing conversational UX should be aware of it.
 """

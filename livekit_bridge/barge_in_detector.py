@@ -12,21 +12,39 @@ of *consecutive* above-threshold frames first.
 Scope: detection only. It does not decide what an utterance is — that is
 ``UtteranceBuffer``'s job — and it uses the same frame size and energy
 threshold as ``UtteranceBuffer`` so both classify each frame identically.
-It keeps the frames of the current run (at most ``min_speech_ms`` worth,
-12 frames by default) only so the entrypoint can put them back into the
-``UtteranceBuffer`` after resetting it on a confirmed barge-in; otherwise
-that reset would throw away the first ``min_speech_ms`` of the very speech
-that triggered it.
+``feed()`` returns the confirming run's own frames, but the entrypoint no
+longer replays them into ``UtteranceBuffer`` (an earlier version of the
+final-review fix did, to "restore" audio after resetting the buffer on a
+confirmed barge-in — that reset was itself a bug, since the buffer never
+holds genuinely stale audio in the first place; see ``entrypoint.py``'s
+``_process_frame`` docstring). Returning the run is kept for callers that
+may want it for logging/diagnostics.
 
 Default 240ms (12 × 20ms frames): inside the 200-300ms band chosen for this
 fix — longer than a click or a typical short noise burst, while still about
-one syllable of real speech, so a genuine interruption is detected quickly.
-A sustained noise longer than this (a long cough, music) still passes; an
-energy-only detector cannot tell those apart from speech. When that
-happens, the interrupted answer is not replaced, because the noise's own
-utterance is filtered to ``""`` after ASR. This is a known limitation of the
-energy-threshold VAD (see ``livekit_bridge/__init__.py``'s "Known
-limitations" list), not something this class claims to solve.
+one syllable of real speech. This is a real detection latency, not an
+instant one: a genuine interruption is confirmed only after ~240ms of
+sustained energy, not on the first loud frame.
+
+Two known false-negative/positive gaps of this energy-only design (see
+``livekit_bridge/__init__.py``'s "Known limitations" list for the full
+picture, this is intentionally not solved here):
+- Real speech with any dip below ``_ENERGY_THRESHOLD`` inside a
+  ``min_speech_ms`` window (a stop closure, a brief pause between
+  syllables) resets ``_run`` and restarts the count, so a genuine
+  interruption can take longer than 240ms to confirm, or in the worst
+  case never confirm before the utterance-completing silence gap.
+- A sustained noise longer than 240ms (a long cough, music) still passes,
+  since an energy-only detector cannot tell it apart from speech — the
+  interrupted answer is stopped with nothing to replace it, because the
+  noise's own utterance is filtered to ``""`` after ASR.
+- ``_fired_this_run`` means a run fires at most once regardless of whether
+  the avatar is speaking at that instant — a loud run that confirms while
+  the avatar is silent "uses up" that confirmation and does not re-fire
+  later just because the avatar starts talking mid-run. In practice this
+  is bounded by ``AsrBridge``'s empty-text filtering and by
+  ``_drive_avatar_with_transcription``'s unconditional per-utterance
+  supersede once the utterance itself completes.
 """
 
 import numpy as np

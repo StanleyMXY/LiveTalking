@@ -132,9 +132,13 @@ to a SenseVoice non-speech marker that ``AsrBridge`` now filters to ``""``.
 ``_process_frame`` now asks ``BargeInDetector`` (``barge_in_detector.py``),
 which reports a speech onset only after 240ms of consecutive above-threshold
 frames, once per run; the barge-in fires if the avatar is speaking at that
-moment. On a barge-in the buffer is reset (dropping stale audio from before
-the onset) and the run's earlier frames are fed back in, so the new
-utterance keeps its first 220ms. See ``_process_frame`` below.
+moment. On a barge-in ``utterance_buffer`` is left untouched — a prior
+version of this fix reset it (meaning to drop stale audio from before the
+onset) and fed the run's own frames back in, but that reset was itself a
+bug: ``UtteranceBuffer`` never holds genuinely stale audio, since it
+auto-resets on every real utterance boundary already, so the reset only
+ever discarded legitimate speech that preceded the confirming run within
+the same still-open utterance. See ``_process_frame`` below.
 
 Interrupt must also clear LiveKit's own audio backlog (code review finding)
 ------------------------------------------------------------------------------
@@ -613,11 +617,21 @@ async def _process_frame(
     Barge-in: fires once ``barge_in_detector`` has seen ``min_speech_ms`` of
     consecutive above-threshold frames *and* the avatar is speaking at that
     moment (module docstring, "Interrupt-handling design"). It supersedes
-    the current response, cancels every pending drive task, and resets
-    ``utterance_buffer`` to drop stale audio — then puts the run's earlier
-    frames back, since those are the start of the new speech. (Replaying at
-    most 11 speech frames cannot hit ``UtteranceBuffer``'s 30s cap, so the
-    replayed ``feed`` calls always return ``None``.)
+    the current response and cancels every pending drive task, but does
+    NOT reset ``utterance_buffer``. An earlier version of this fix reset it
+    and replayed the confirming run's own frames back in, meant to drop
+    "stale" audio — but ``UtteranceBuffer.feed`` only ever accumulates
+    speech chunks and auto-emits (and resets itself) once a real utterance
+    boundary is crossed (``silence_threshold_ms`` of silence, or the
+    ``max_utterance_ms`` cap), so by construction nothing genuinely stale
+    can be sitting in it: whatever it holds at the moment of a confirmed
+    barge-in already belongs to the same still-open utterance the barge-in
+    is part of (final-review fix-round finding). Resetting it there was
+    itself the bug — it silently dropped the user's own opening words
+    whenever their speech had a sub-``min_speech_ms`` dip near onset (a
+    common pattern: stop closures, the gap between two short words), since
+    only the confirming run's own frames were ever replayed, not whatever
+    legitimately preceded them in the same utterance.
 
     On a completed utterance, the transcribe-then-drive sequence is
     scheduled as a tracked background task (added to ``pending_tasks``, a
@@ -635,9 +649,6 @@ async def _process_frame(
     if confirmed_run is not None and avatar_session.is_speaking():
         _supersede_in_flight_response(pipeline_bridge, avatar_session)
         _cancel_pending_drive_tasks(pending_tasks)
-        utterance_buffer.reset()
-        for earlier_chunk in confirmed_run[:-1]:
-            utterance_buffer.feed(earlier_chunk)
 
     completed_utterance = utterance_buffer.feed(chunk)
     if completed_utterance is not None:

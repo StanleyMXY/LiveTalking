@@ -142,10 +142,12 @@ class LiveKitOutput(BaseOutput):
         ASR/TTS/render queues — it has no generic hook into a specific
         ``BaseOutput`` implementation's own buffer, and none of the other
         existing outputs need one cleared this way. Called explicitly by
-        ``livekit_bridge.entrypoint`` on a detected barge-in (see that
-        module's docstring), so stale queued speech does not keep playing
-        out of a LiveKit session after an interrupt just because
-        ``AudioSource`` itself buffers up to a second ahead
+        ``livekit_bridge.entrypoint`` whenever the current response is
+        superseded — both on a detected barge-in and on every newer
+        meaningful utterance (see that module's docstring, "Every
+        meaningful utterance supersedes") — so stale queued speech does not
+        keep playing out of a LiveKit session after an interrupt just
+        because ``AudioSource`` itself buffers up to a second ahead
         (audio_source.py:38, ``queue_size_ms: int = 1000``).
         """
         self._audio_source.clear_queue()

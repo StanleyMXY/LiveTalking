@@ -88,6 +88,24 @@ actually dispatching a real job in this session — see the Task 8 report.
 The ``JobExecutorType.PROCESS`` path (a genuine subprocess per job,
 relevant if a future change ever needs it) was verified only by reading
 ``job_proc_executor.py``/``proc_pool.py``'s source, not by running it.
+
+This script must be launched by running it directly (code review note)
+------------------------------------------------------------------------------
+``_load_and_wire_pipeline()`` only runs because it is called from this
+file's own ``if __name__ == "__main__":`` block, which only executes when
+this file is run directly (``python -m livekit_bridge.worker_app dev`` /
+``python livekit_bridge/worker_app.py dev``). The framework's other
+launchers (the ``lk agent`` CLI, or anything that does
+``importlib.import_module("livekit_bridge.worker_app")`` instead of
+running it as ``__main__``) would import this module without ever
+executing that block, silently skipping the one-time model load — the
+first job dispatched under such a launcher would then fail loudly inside
+``entrypoint()``/``_create_avatar_session`` (``app.opt``/``app.model`` are
+never set, so ``app.build_avatar_session`` would raise ``AttributeError``
+or use stale/`None` globals), not silently produce a broken session. This
+is an accepted constraint, not fixed here: a human deploying this worker
+must launch it by running this file directly, not through a launcher that
+imports it as a plain module.
 """
 
 from __future__ import annotations

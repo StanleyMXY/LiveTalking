@@ -15,12 +15,42 @@ from utils.logger import logger
 if TYPE_CHECKING:
     from avatars.base_avatar import BaseAvatar
 
+# avatars/base_avatar.py's render() throttle loop (base_avatar.py:529-532)
+# treats get_buffer_size()'s return value as a count of queued *video*
+# frames, each RENDER_LOOP_FRAME_SECONDS long: `if buffer_size >= 5:
+# time.sleep(0.04 * buffer_size * 0.8)`. server/webrtc.py's own
+# get_buffer_size() (server/webrtc.py:202-203) returns exactly that: a
+# literal video-frame queue depth (`self.__video._queue.qsize()`).
+# LiveKitOutput drops video entirely (push_video_frame is a no-op below),
+# so there is no video queue to report — it reports the *audio* backlog
+# instead (AudioSource.queued_duration, in seconds — audio_source.py:83-86),
+# converted into the same frame-duration units so the shared ">= 5"
+# threshold means the same amount of real backlog regardless of which
+# output implementation is active.
+_RENDER_LOOP_FRAME_SECONDS = 0.04
+
 
 class LiveKitOutput(BaseOutput):
     """把管线合成的音频推到LiveKit房间的本地音频track；不处理视频。
 
     视频帧被丢弃(no-op) —— 数字人渲染循环仍会照常运行并消耗对应的GPU算力，
     这是现有渲染循环耦合决定的既定成本，不由本类负责节省。
+
+    Code-review finding, fixed here: this class previously did not override
+    ``get_buffer_size()`` at all, so it inherited ``BaseOutput``'s always-``0``
+    default (streamout/base_output.py:45-47) — unlike every other existing
+    output (webrtc/rtmp/virtualcam), which all implement real throttling
+    here. Concretely: ``push_audio_frame`` below fires an unbounded number of
+    ``run_coroutine_threadsafe(capture_frame(...))`` calls without ever
+    waiting for any of them (see its own docstring) — ``capture_frame``
+    itself blocks once ``rtc.AudioSource``'s native 1000ms queue fills
+    (audio_source.py:106-109: "If the size of the audio frame exceeds the
+    internal queue size, the method will wait"), but that wait happens on
+    the *event loop* thread inside the scheduled coroutine, not on the
+    render thread calling ``push_audio_frame`` — so nothing was slowing the
+    render thread down to match, and pending frames/coroutines could grow
+    without bound, with speech ending up queued behind an ever-growing
+    silence backlog.
     """
 
     def __init__(
@@ -94,6 +124,31 @@ class LiveKitOutput(BaseOutput):
 
         if self.parent:
             self.parent.notify(eventpoint)
+
+    def get_buffer_size(self) -> int:
+        """How backed up the LiveKit-side audio queue is, in the same
+        video-frame-duration units every other output's ``get_buffer_size()``
+        uses — see the module-level ``_RENDER_LOOP_FRAME_SECONDS`` comment
+        for why raw ``queued_duration`` seconds cannot be returned directly.
+        """
+        return int(self._audio_source.queued_duration / _RENDER_LOOP_FRAME_SECONDS)
+
+    def clear_queue(self) -> None:
+        """Discard whatever synthesized audio is still queued in
+        ``rtc.AudioSource``'s own internal buffer.
+
+        ``flush_talk()`` (the pipeline's canonical interrupt handler,
+        ``avatars/base_avatar.py``) only clears the pipeline's own upstream
+        ASR/TTS/render queues — it has no generic hook into a specific
+        ``BaseOutput`` implementation's own buffer, and none of the other
+        existing outputs need one cleared this way. Called explicitly by
+        ``livekit_bridge.entrypoint`` on a detected barge-in (see that
+        module's docstring), so stale queued speech does not keep playing
+        out of a LiveKit session after an interrupt just because
+        ``AudioSource`` itself buffers up to a second ahead
+        (audio_source.py:38, ``queue_size_ms: int = 1000``).
+        """
+        self._audio_source.clear_queue()
 
     def stop(self) -> None:
         pass

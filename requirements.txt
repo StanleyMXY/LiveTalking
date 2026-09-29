@@ -42,7 +42,16 @@ diffusers
 accelerate
 
 librosa
-openai
+# Was unpinned. livekit-agents==1.8.3 (see below) declares its own
+# constraint on this same package (`openai<3,>=2.50`, per its published
+# PyPI metadata) and `pip install livekit-agents` silently downgraded the
+# previously-installed openai==3.16.2 to 2.54.0 to satisfy it. Pinned to
+# that same range here, with this comment, so a future fresh install can't
+# silently drift onto a version outside what livekit-agents actually
+# supports. llm.py's own usage (OpenAI(api_key=, base_url=) +
+# client.chat.completions.create(..., stream=True)) was checked against
+# 2.54.0 and still matches.
+openai<3,>=2.50
 #websocket-client
 websockets==12.0
 dashscope

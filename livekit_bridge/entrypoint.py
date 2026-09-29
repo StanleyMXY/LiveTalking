@@ -14,17 +14,23 @@ before accepting it, not merely allowed to happen).
 
 Verified facts, with citations
 -------------------------------
-- **The room is not connected when the entrypoint starts.**
-  ``JobContext.room``'s docstring says so explicitly: "When the entrypoint
-  is called, the worker has not connected to the Room yet."
-  (``livekit/agents/job.py:505-511``). A live check confirms it concretely:
-  a freshly constructed ``rtc.Room()`` has ``.name == ''``. The brief's
-  draft reads ``ctx.room.name`` as the very first line of ``entrypoint()``,
-  before any connect call — that would read an empty string. The real,
-  pre-connect-safe room name is ``ctx.job.room.name``: ``ctx.job`` is a
-  ``livekit.protocol.agent.Job`` protobuf message (``JobContext.job``
-  property, ``job.py:494-497``), whose ``room`` field is a
-  ``livekit.protocol.models.Room`` message that does carry a ``name``
+- **The room is not connected when the entrypoint starts, and
+  ``ctx.room.name`` is not the documented way to read the room name before
+  that.** ``JobContext.room``'s docstring says explicitly: "When the
+  entrypoint is called, the worker has not connected to the Room yet."
+  (``livekit/agents/job.py:505-511``). Correction from an earlier version
+  of this docstring, made during code review: a bare, freshly constructed
+  ``rtc.Room()`` does have ``.name == ''``, but that is not proof about the
+  *real* ``ctx.room`` object — the framework actually pre-populates
+  ``self._room._info.name`` from the dispatch info before the entrypoint
+  ever runs (``livekit/agents/ipc/job_proc_lazy_main.py:307``), so
+  ``ctx.room.name`` may already happen to be correct by the time the
+  entrypoint starts. That is an internal implementation detail, not a
+  documented contract, so this module still does not rely on it. The
+  documented, pre-connect-safe room name is ``ctx.job.room.name``:
+  ``ctx.job`` is a ``livekit.protocol.agent.Job`` protobuf message
+  (``JobContext.job`` property, ``job.py:494-497``), whose ``room`` field
+  is a ``livekit.protocol.models.Room`` message that does carry a ``name``
   field (verified against both messages' protobuf descriptors) and is
   populated by the dispatch/assignment before the entrypoint ever runs.
   See ``_room_name_from_job`` below.
@@ -124,6 +130,80 @@ speaking almost immediately (``flush_talk()``), so ``is_speaking()`` goes
 false and further micro-pauses in the same (new) utterance no longer
 re-trigger it. See ``_process_frame`` below.
 
+Interrupt must also clear LiveKit's own audio backlog (code review finding)
+------------------------------------------------------------------------------
+``flush_talk()`` (``PipelineBridge.interrupt``) only clears the pipeline's
+own upstream ASR/TTS/render queues — it has no way to reach into a specific
+``BaseOutput`` implementation's own buffer, and none of the other existing
+outputs (webrtc/rtmp/virtualcam) need one cleared this way, so nothing
+wires this up generically. ``streamout.livekit_output.LiveKitOutput``
+forwards synthesized audio into ``rtc.AudioSource``, which keeps its own
+internal queue (default up to 1000ms — ``livekit/rtc/audio_source.py:38``,
+``queue_size_ms: int = 1000``) independent of anything ``flush_talk()``
+touches; without clearing it too, an interrupt would still let up to a
+second of stale, already-queued speech play out before new speech starts.
+``AudioSource.clear_queue()`` (``audio_source.py:88-100``) exists exactly
+for this. On a detected barge-in, ``_process_frame`` calls
+``avatar_session.output.clear_queue()`` if the current output exposes one
+(the same optional-capability ``hasattr`` pattern
+``avatars/base_avatar.py:529`` already uses for ``get_buffer_size()``), in
+addition to ``pipeline_bridge.interrupt()``/``utterance_buffer.reset()``.
+
+The frame-iteration loop must not stall waiting for the LLM (code review finding)
+--------------------------------------------------------------------------------------
+An earlier version of this module ``await``ed both
+``asr_bridge.transcribe`` and ``pipeline_bridge.drive_with_text`` inline,
+sequentially, inside the ``async for frame_event in audio_stream`` loop.
+Since ``llm_response`` streams synchronously to completion
+(``llm.py:45``), that ``await`` chain does not return until the whole LLM
+response has streamed — during which the loop pulls no new frames from
+``audio_stream`` at all. Frames still arrive (buffered inside
+``AudioStream``'s own queue) but are only processed in a burst afterward,
+which also delays interrupt detection for the entire duration of the LLM
+call — exactly the tail-latency problem this plan's Review Focus calls
+out, just moved to a different queue. The existing ``/human`` route already
+avoids this for the same reason: it fires ``run_in_executor`` for
+``llm_response`` without awaiting it (``server/routes.py:71-76``). This
+module now does the same: ``_process_frame`` schedules the
+transcribe-then-drive sequence as a tracked background task
+(``loop.create_task``, kept in a ``pending_tasks`` set so it is not
+garbage-collected mid-flight and so its exceptions are logged via a
+done-callback instead of silently dropped) and returns immediately,
+letting the frame loop keep draining and keep detecting interrupts while
+the LLM streams. A known, separate, out-of-scope gap (not fixed here, per
+code review guidance not to make it worse without a real fix): there is no
+LLM cancellation token anywhere in ``llm.py``, so after ``flush_talk()`` an
+already-in-flight ``llm_response`` call still runs to completion and still
+calls ``avatar_session.put_msg_txt`` for the old answer once it finishes —
+``entrypoint.py``'s ``finally`` block cancels any *not-yet-started*
+background task (preventing a queued-but-not-running
+``drive_with_text`` call from firing against a torn-down session) but
+cannot stop a call that is already executing inside the executor thread.
+
+The job does not end on its own — ``ctx.shutdown()`` must be called (code review finding)
+---------------------------------------------------------------------------------------------
+Read ``livekit/agents/ipc/job_proc_lazy_main.py:280-420``: the job task
+``await``s a single ``self._shutdown_fut``
+(``job_proc_lazy_main.py:400``), which is resolved only by the room's
+``"disconnected"`` event (``:289-294``), an explicit ``ctx.shutdown()``
+call (``:299-305``), or the entrypoint task raising *before*
+``ctx.connect()`` was ever called (``:376-387``, a crash-before-connect
+safety net). If the entrypoint coroutine simply *returns* — no exception,
+and ``ctx.connect()`` was already called — none of those three fire, and
+the job sits waiting on ``_shutdown_fut`` forever, holding a thread/executor
+slot (see ``livekit_bridge/worker_app.py``'s module docstring for how one
+job-executor is spawned per job). This is a real leak on two of this
+module's own paths that previously just ``return``ed: the duplicate-
+dispatch early return (the room is never even connected on that path, so
+``"disconnected"`` can never fire either) and the "no audio track arrived
+within the timeout" path (the room stays connected — the participant just
+never published audio — so ``"disconnected"`` may never fire). Both paths,
+and the main ``finally`` block (covering normal completion/exception/
+cancellation), now call ``ctx.shutdown(reason=...)``
+(``job.py:871-872`` — synchronous, safe to call redundantly: the framework
+suppresses ``asyncio.InvalidStateError`` if the future is already resolved,
+``job_proc_lazy_main.py:302``).
+
 What is verified vs. not — see the Task 8 report
 ---------------------------------------------------
 Everything above was checked against real installed SDK/package source
@@ -175,8 +255,13 @@ _registry = BridgeSessionRegistry()
 def _room_name_from_job(ctx: JobContext) -> str:
     """The dispatch-time room name, safe to read before ``ctx.connect()``.
 
-    ``ctx.room.name`` is '' until connected (see module docstring); the pre-
-    connect-safe value lives on the job info itself.
+    ``JobContext.room``'s own docstring says the room is not connected yet
+    when the entrypoint starts; ``ctx.job.room.name`` is the documented,
+    dispatch-time value that does not depend on that (see module
+    docstring's room-name paragraph for the full citation, including a
+    correction: whether ``ctx.room.name`` also happens to already be
+    populated at this point is an internal implementation detail, not a
+    documented guarantee, so this function does not rely on it either way).
     """
     return ctx.job.room.name
 
@@ -245,10 +330,17 @@ async def _create_avatar_session(
     ``process_frames`` loop starts (``avatars/base_avatar.py:430:
     self.output.start()``), and ``BaseAvatar.__init__`` never constructs an
     output object for an unrecognized ``opt.transport`` (see
-    ``worker_app.py``'s ``prewarm`` for why ``opt.transport`` is
-    deliberately set to ``'livekit'``, a value ``_output_modules`` does not
-    recognize) — so overriding ``.output`` here, before starting the render
-    thread, races nothing.
+    ``worker_app.py``'s ``_load_and_wire_pipeline`` for why ``opt.transport``
+    is deliberately set to ``'livekit'``, a value ``_output_modules`` does
+    not recognize) — so overriding ``.output`` here, before starting the
+    render thread, races nothing.
+
+    ``parent=avatar_session`` is passed to ``LiveKitOutput`` so
+    ``push_audio_frame``'s ``self.parent.notify(eventpoint)``
+    (``streamout/livekit_output.py:95-96``) actually fires, matching every
+    other existing output (``registry.create("streamout", ..., parent=self)``,
+    ``avatars/base_avatar.py:151``) instead of silently dropping status
+    events.
 
     ``quit_event`` is assigned onto the session *before* starting the
     thread (not left for ``render()`` to assign on its own first line) so
@@ -261,13 +353,48 @@ async def _create_avatar_session(
 
     quit_event = threading.Event()
     avatar_session.quit_event = quit_event
-    avatar_session.output = LiveKitOutput(audio_source, loop)
+    avatar_session.output = LiveKitOutput(audio_source, loop, parent=avatar_session)
 
     render_thread = threading.Thread(
         target=avatar_session.render, args=(quit_event,), daemon=True
     )
     render_thread.start()
     return avatar_session
+
+
+async def _drive_avatar_with_transcription(
+    loop: asyncio.AbstractEventLoop,
+    asr_bridge: AsrBridge,
+    pipeline_bridge: PipelineBridge,
+    avatar_session,
+    audio: np.ndarray,
+) -> None:
+    """Transcribe one completed utterance and drive the avatar with it.
+
+    Both steps are deliberately synchronous/blocking (``asr_bridge.py``,
+    ``pipeline_bridge.py`` docstrings) — offloaded here via
+    ``loop.run_in_executor``, exactly like the pipeline's own existing
+    ``/human`` route and websocket ASR handler already do for the same
+    underlying calls (``server/routes.py:71-76``,
+    ``server/asr_server.py:218-224``). This whole coroutine is meant to be
+    scheduled as a background task (see ``_process_frame`` and module
+    docstring's "frame-iteration loop must not stall" section), not
+    awaited inline in the frame loop — calling it directly would block
+    LiveKit's own async event handling for the duration of each
+    inference/LLM call, and would stall frame draining (hence interrupt
+    detection) for the whole LLM response on top of that.
+    """
+    text = await loop.run_in_executor(None, asr_bridge.transcribe, audio)
+    await loop.run_in_executor(None, pipeline_bridge.drive_with_text, avatar_session, text)
+
+
+def _on_drive_task_done(task: "asyncio.Task[None]", pending_tasks: set) -> None:
+    pending_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("drive_with_text background task failed", exc_info=exc)
 
 
 async def _process_frame(
@@ -279,6 +406,7 @@ async def _process_frame(
     pipeline_bridge: PipelineBridge,
     avatar_session,
     loop: asyncio.AbstractEventLoop,
+    pending_tasks: set,
 ) -> bool:
     """Process one already-format-converted 20ms audio chunk.
 
@@ -287,14 +415,12 @@ async def _process_frame(
     unit-testable with a mocked ``avatar_session``/bridges/buffer and no
     real LiveKit connection at all.
 
-    ``asr_bridge.transcribe`` and ``pipeline_bridge.drive_with_text`` are
-    both deliberately synchronous/blocking (asr_bridge.py, pipeline_bridge.py
-    docstrings) — offloaded here via ``loop.run_in_executor``, exactly like
-    the pipeline's own existing ``/human`` route and websocket ASR handler
-    already do for the same underlying calls (server/routes.py:71-76,
-    server/asr_server.py:218-224). Calling them directly on this coroutine
-    would block LiveKit's own async event handling (room heartbeats, other
-    events) for the duration of each inference/LLM call.
+    On a completed utterance, the transcribe-then-drive sequence is
+    scheduled as a tracked background task (added to ``pending_tasks``, a
+    set owned by the caller so the task is never garbage-collected
+    mid-flight and so ``entrypoint``'s ``finally`` block can cancel any
+    still-pending ones) rather than awaited here — see module docstring's
+    "frame-iteration loop must not stall" section for why.
     """
     if chunk.size == 0:
         return was_speech
@@ -307,13 +433,24 @@ async def _process_frame(
         # unconditionally.
         pipeline_bridge.interrupt(avatar_session)
         utterance_buffer.reset()
+        # Also clear whatever synthesized audio is still queued on the
+        # LiveKit side itself — flush_talk() cannot reach it. See module
+        # docstring's "Interrupt must also clear LiveKit's own audio
+        # backlog" section.
+        output = getattr(avatar_session, "output", None)
+        clear_queue = getattr(output, "clear_queue", None)
+        if clear_queue is not None:
+            clear_queue()
 
     completed_utterance = utterance_buffer.feed(chunk)
     if completed_utterance is not None:
-        text = await loop.run_in_executor(None, asr_bridge.transcribe, completed_utterance)
-        await loop.run_in_executor(
-            None, pipeline_bridge.drive_with_text, avatar_session, text
+        task = loop.create_task(
+            _drive_avatar_with_transcription(
+                loop, asr_bridge, pipeline_bridge, avatar_session, completed_utterance
+            )
         )
+        pending_tasks.add(task)
+        task.add_done_callback(lambda t: _on_drive_task_done(t, pending_tasks))
 
     return is_speech
 
@@ -332,10 +469,16 @@ async def entrypoint(ctx: JobContext) -> None:
             "skipping duplicate dispatch",
             room_name,
         )
+        # The room is never connected on this path, so nothing will ever
+        # resolve the framework's shutdown future on its own (see module
+        # docstring's "the job does not end on its own" section) — without
+        # this, the job would sit idle forever holding an executor slot.
+        ctx.shutdown(reason="duplicate dispatch for room already in progress")
         return
 
     avatar_session = None
     audio_stream = None
+    pending_drive_tasks: "set[asyncio.Task[None]]" = set()
     try:
         # ctx.job.metadata really is a real field on the Job proto (verified
         # against its descriptor) — but its contents are an unestablished
@@ -386,14 +529,32 @@ async def entrypoint(ctx: JobContext) -> None:
                 pipeline_bridge=pipeline_bridge,
                 avatar_session=avatar_session,
                 loop=loop,
+                pending_tasks=pending_drive_tasks,
             )
     finally:
         # Review Focus "连接壳进程异常退出/房间意外断开": this must run on
         # every exit path — normal completion, an exception propagating out
         # of the try body, or this task being cancelled by the framework —
         # and a plain try/finally guarantees that in all three cases.
+
+        # Best-effort: stop any not-yet-started background drive task from
+        # firing against a session that's about to be torn down. Cannot
+        # stop one that is already running inside the executor thread (see
+        # module docstring's "frame-iteration loop must not stall" section
+        # for the known, separate, out-of-scope llm.py cancellation gap).
+        for task in pending_drive_tasks:
+            task.cancel()
+
+        # aclose() gets its own try/except: if it raises, the session and
+        # registry cleanup below must still run unconditionally — otherwise
+        # a single aclose() failure would leak the GPU render thread and
+        # permanently stick this room to this worker (code review finding).
         if audio_stream is not None:
-            await audio_stream.aclose()
+            try:
+                await audio_stream.aclose()
+            except Exception:
+                logger.exception("room '%s': audio_stream.aclose() failed", room_name)
+
         # Unconditional (not gated on `avatar_session is not None`):
         # session_manager.remove_session is a no-op when room_name was never
         # tracked (server/session_manager.py:91: `if sessionid in
@@ -415,3 +576,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # start building a second session before the first one's resources
         # are actually released.
         _registry.release(room_name)
+        # See module docstring's "the job does not end on its own" section:
+        # the entrypoint coroutine returning is not, by itself, enough to
+        # end the job — this call is what actually does.
+        ctx.shutdown(reason="connection shell job finished")

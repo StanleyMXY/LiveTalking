@@ -17,13 +17,24 @@ class FakeAudioSource:
     an `rtc.AudioFrame` object (not a raw numpy array).
     """
 
-    def __init__(self, sample_rate=16000, num_channels=1):
+    def __init__(self, sample_rate=16000, num_channels=1, queued_duration=0.0):
         self.sample_rate = sample_rate
         self.num_channels = num_channels
         self.captured_frames = []
+        # Real AudioSource.queued_duration is a computed property
+        # (audio_source.py:83-86); this fake exposes it as a plain settable
+        # attribute so tests can drive it directly.
+        self.queued_duration = queued_duration
+        self.clear_queue_called = False
 
     async def capture_frame(self, frame):
         self.captured_frames.append(frame)
+
+    def clear_queue(self):
+        # Real AudioSource.clear_queue() (audio_source.py:88-100) is
+        # synchronous.
+        self.clear_queue_called = True
+        self.queued_duration = 0.0
 
 
 @pytest.mark.asyncio
@@ -98,3 +109,43 @@ def test_push_audio_frame_survives_closed_event_loop():
 
     # The frame is dropped, not queued or retried.
     assert fake_source.captured_frames == []
+
+
+# ─── get_buffer_size() / clear_queue() (code review C2 fix) ────────────
+
+
+def test_get_buffer_size_converts_queued_duration_to_frame_units():
+    # Code review C2: LiveKitOutput previously did not override
+    # get_buffer_size() at all, so it silently inherited BaseOutput's
+    # always-0 default (base_output.py:45-47) and the render() throttle
+    # (base_avatar.py:529-532) never engaged for a LiveKit session. It must
+    # now report the AudioSource backlog, converted from seconds into the
+    # same video-frame-duration units (0.04s/unit) every other output's
+    # get_buffer_size() uses, so the shared ">= 5" threshold means the same
+    # amount of real backlog.
+    fake_source = FakeAudioSource(queued_duration=0.28)  # 7 units * 0.04s
+    output = LiveKitOutput(audio_source=fake_source, loop=asyncio.new_event_loop())
+
+    assert output.get_buffer_size() == 7
+
+
+def test_get_buffer_size_is_zero_when_queue_is_empty():
+    fake_source = FakeAudioSource(queued_duration=0.0)
+    output = LiveKitOutput(audio_source=fake_source, loop=asyncio.new_event_loop())
+
+    assert output.get_buffer_size() == 0
+
+
+def test_clear_queue_delegates_to_the_real_audio_source_method():
+    # Code review C2: flush_talk() cannot reach LiveKit's own queued audio
+    # on interrupt — LiveKitOutput.clear_queue() is what
+    # livekit_bridge.entrypoint calls instead, and it must forward to the
+    # real AudioSource.clear_queue() (audio_source.py:88-100), not some
+    # invented no-op.
+    fake_source = FakeAudioSource(queued_duration=0.9)
+    output = LiveKitOutput(audio_source=fake_source, loop=asyncio.new_event_loop())
+
+    output.clear_queue()
+
+    assert fake_source.clear_queue_called is True
+    assert output.get_buffer_size() == 0

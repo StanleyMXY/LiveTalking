@@ -14,14 +14,21 @@ unit-testable without live infrastructure, and is covered below:
   fake/mock;
 - the interrupt-detection gating logic in `_process_frame`, including the
   case the brief's "unconditional" suggestion would have gotten wrong
-  (a mid-utterance energy dip while the avatar is NOT speaking);
+  (a mid-utterance energy dip while the avatar is NOT speaking), and that a
+  detected barge-in also clears LiveKitOutput's own queued audio (code
+  review C2);
 - that the two documented-blocking calls (`asr_bridge.transcribe`,
   `pipeline_bridge.drive_with_text`) are actually executed off the calling
-  thread via `run_in_executor`, not merely moved around;
+  thread via `run_in_executor`, not merely moved around, and that they are
+  scheduled as a background task rather than awaited inline so the frame
+  loop keeps draining while the LLM streams (code review I1);
 - that `entrypoint()`'s `finally` block runs (and calls
-  `session_manager.remove_session` + releases the room registry) on every
-  exit path: normal stream completion, an exception propagating out of the
-  frame loop, and the "no audio track ever arrived" timeout path.
+  `session_manager.remove_session`, releases the room registry, and calls
+  `ctx.shutdown()`) on every exit path: normal stream completion, an
+  exception propagating out of the frame loop, task cancellation, the "no
+  audio track ever arrived" timeout path, and even when `aclose()` itself
+  raises (code review I2/I3); and that the duplicate-dispatch early return
+  also calls `ctx.shutdown()` (code review I2).
 """
 
 import asyncio
@@ -54,12 +61,13 @@ def _fake_frame_event(is_speech: bool = False, n: int = 320):
 
 
 def test_room_name_from_job_reads_pre_connect_safe_field():
-    # ctx.room.name is '' before ctx.connect() is ever called (verified
-    # live against the installed SDK: rtc.Room().name == ''); the real,
-    # pre-connect-safe room name lives on ctx.job.room.name instead.
+    # JobContext.room's own docstring says the room is not connected yet
+    # when the entrypoint starts; ctx.job.room.name is the documented,
+    # dispatch-time value this function relies on instead (see
+    # entrypoint.py's module docstring for the full citation, including a
+    # correction about ctx.room.name's actual pre-connect state).
     ctx = MagicMock()
     ctx.job.room.name = "expected-room"
-    ctx.room.name = ""
 
     assert ep._room_name_from_job(ctx) == "expected-room"
 
@@ -179,6 +187,10 @@ async def test_create_avatar_session_wires_output_and_starts_render_thread():
     # docstring on this function for why).
     assert isinstance(fake_avatar_session.quit_event, threading.Event)
     assert isinstance(fake_avatar_session.output, LiveKitOutput)
+    # parent=avatar_session (code review minor finding): without it,
+    # LiveKitOutput.push_audio_frame's self.parent.notify(eventpoint) is
+    # silently dropped, unlike every other existing output.
+    assert fake_avatar_session.output.parent is fake_avatar_session
 
     fake_thread_cls.assert_called_once_with(
         target=fake_avatar_session.render,
@@ -214,6 +226,7 @@ async def test_process_frame_no_interrupt_when_avatar_not_speaking():
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=set(),
     )
 
     assert was_speech is True
@@ -240,11 +253,68 @@ async def test_process_frame_interrupts_on_barge_in_while_avatar_speaking():
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=set(),
     )
 
     assert was_speech is True
     pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
     utterance_buffer.reset.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_frame_clears_output_queue_on_barge_in():
+    # Code review C2: flush_talk() cannot reach LiveKit's own queued audio.
+    # A detected barge-in must also call avatar_session.output.clear_queue()
+    # when the current output exposes one.
+    avatar_session = MagicMock()
+    avatar_session.is_speaking.return_value = True
+    avatar_session.output = MagicMock(spec=LiveKitOutput)
+    pipeline_bridge = MagicMock()
+    utterance_buffer = MagicMock()
+    utterance_buffer.feed.return_value = None
+    asr_bridge = MagicMock()
+    loop = asyncio.get_running_loop()
+
+    await ep._process_frame(
+        _make_chunk(is_speech=True),
+        was_speech=False,
+        utterance_buffer=utterance_buffer,
+        asr_bridge=asr_bridge,
+        pipeline_bridge=pipeline_bridge,
+        avatar_session=avatar_session,
+        loop=loop,
+        pending_tasks=set(),
+    )
+
+    avatar_session.output.clear_queue.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_frame_barge_in_survives_output_without_clear_queue():
+    # Other outputs (webrtc/rtmp/virtualcam) do not implement clear_queue()
+    # at all — the hasattr-style guard must not raise for them.
+    avatar_session = MagicMock()
+    avatar_session.is_speaking.return_value = True
+    avatar_session.output = object()  # deliberately has no clear_queue
+    pipeline_bridge = MagicMock()
+    utterance_buffer = MagicMock()
+    utterance_buffer.feed.return_value = None
+    asr_bridge = MagicMock()
+    loop = asyncio.get_running_loop()
+
+    # Must not raise.
+    await ep._process_frame(
+        _make_chunk(is_speech=True),
+        was_speech=False,
+        utterance_buffer=utterance_buffer,
+        asr_bridge=asr_bridge,
+        pipeline_bridge=pipeline_bridge,
+        avatar_session=avatar_session,
+        loop=loop,
+        pending_tasks=set(),
+    )
+
+    pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
 
 
 @pytest.mark.asyncio
@@ -268,6 +338,7 @@ async def test_process_frame_no_interrupt_without_silence_to_speech_transition()
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=set(),
     )
 
     pipeline_bridge.interrupt.assert_not_called()
@@ -290,6 +361,7 @@ async def test_process_frame_empty_chunk_is_noop():
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=set(),
     )
 
     assert was_speech is False
@@ -297,7 +369,7 @@ async def test_process_frame_empty_chunk_is_noop():
     avatar_session.is_speaking.assert_not_called()
 
 
-# ─── _process_frame: executor offloading ────────────────────────────────
+# ─── _process_frame: executor offloading + background scheduling ───────
 
 
 @pytest.mark.asyncio
@@ -325,6 +397,7 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
     utterance_buffer = MagicMock()
     utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
     loop = asyncio.get_running_loop()
+    pending_tasks: set = set()
 
     await ep._process_frame(
         _make_chunk(is_speech=False),
@@ -334,7 +407,13 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=pending_tasks,
     )
+
+    # The drive-with-transcription sequence is now a scheduled background
+    # task (code review I1), not awaited inline — give it a moment to run.
+    assert len(pending_tasks) == 1
+    await asyncio.gather(*pending_tasks)
 
     assert call_threads.get("transcribe") not in (None, main_thread_id)
     assert call_threads.get("drive_with_text") not in (None, main_thread_id)
@@ -350,6 +429,7 @@ async def test_process_frame_skips_asr_when_no_utterance_completed():
     utterance_buffer = MagicMock()
     utterance_buffer.feed.return_value = None
     loop = asyncio.get_running_loop()
+    pending_tasks: set = set()
 
     await ep._process_frame(
         _make_chunk(is_speech=True),
@@ -359,10 +439,58 @@ async def test_process_frame_skips_asr_when_no_utterance_completed():
         pipeline_bridge=pipeline_bridge,
         avatar_session=avatar_session,
         loop=loop,
+        pending_tasks=pending_tasks,
     )
 
+    assert pending_tasks == set()
     asr_bridge.transcribe.assert_not_called()
     pipeline_bridge.drive_with_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_frame_does_not_block_caller_on_a_slow_drive_call():
+    # Code review I1's core claim: _process_frame must return promptly even
+    # if the transcribe/drive sequence is slow, so entrypoint()'s frame loop
+    # keeps draining (and keeps detecting interrupts) while it runs. A real
+    # (short) blocking sleep inside the fake transcribe, run for real in the
+    # executor thread pool, is the most direct way to prove this without
+    # mocking time itself.
+    import time
+
+    def slow_transcribe(audio):
+        time.sleep(0.3)
+        return "text"
+
+    avatar_session = MagicMock()
+    avatar_session.is_speaking.return_value = False
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.side_effect = slow_transcribe
+    pipeline_bridge = MagicMock()
+    utterance_buffer = MagicMock()
+    utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
+    loop = asyncio.get_running_loop()
+    pending_tasks: set = set()
+
+    call_started_at = loop.time()
+    await ep._process_frame(
+        _make_chunk(is_speech=False),
+        was_speech=False,
+        utterance_buffer=utterance_buffer,
+        asr_bridge=asr_bridge,
+        pipeline_bridge=pipeline_bridge,
+        avatar_session=avatar_session,
+        loop=loop,
+        pending_tasks=pending_tasks,
+    )
+    elapsed = loop.time() - call_started_at
+
+    # _process_frame itself must return almost immediately: the transcribe
+    # call (which sleeps for 0.3s) runs in a background task, not awaited
+    # here — this call returning well under that proves it.
+    assert elapsed < 0.15
+    assert len(pending_tasks) == 1
+
+    await asyncio.gather(*pending_tasks)
 
 
 # ─── entrypoint(): dedup + cleanup on every exit path ───────────────────
@@ -404,6 +532,10 @@ async def test_entrypoint_skips_duplicate_dispatch_for_same_room():
         ctx = _make_ctx("room-dup")
         await ep.entrypoint(ctx)
         ctx.connect.assert_not_called()
+        # Code review I2: the room is never connected on this path, so
+        # nothing else will ever end the job on its own — entrypoint()
+        # must tell the framework explicitly.
+        ctx.shutdown.assert_called_once()
 
     registry.release("room-dup")
 
@@ -436,6 +568,7 @@ async def test_entrypoint_cleans_up_on_normal_stream_completion():
     ctx.connect.assert_awaited_once()
     fake_stream.aclose.assert_awaited_once()
     fake_remove.assert_called_once_with("room-1")
+    ctx.shutdown.assert_called_once()
     # Released, not left held:
     assert registry.acquire("room-1") is True
     registry.release("room-1")
@@ -468,12 +601,53 @@ async def test_entrypoint_cleans_up_when_exception_raised_mid_loop():
             await ep.entrypoint(ctx)
 
     # finally must still run on the exception path: stream closed, session
-    # removed, room released — this is the "process crash/disconnect
-    # resource leak" Review Focus item.
+    # removed, room released, job told to shut down — this is the "process
+    # crash/disconnect resource leak" Review Focus item.
     fake_stream.aclose.assert_awaited_once()
     fake_remove.assert_called_once_with("room-2")
+    ctx.shutdown.assert_called_once()
     assert registry.acquire("room-2") is True
     registry.release("room-2")
+
+
+@pytest.mark.asyncio
+async def test_entrypoint_cleans_up_when_aclose_itself_raises():
+    # Code review I3: an earlier version awaited audio_stream.aclose()
+    # directly in `finally`, ahead of the session/registry cleanup — if
+    # aclose() raised, everything after it in that finally block was
+    # skipped, leaking the GPU render thread and permanently sticking the
+    # room to this worker. aclose() failing must not prevent the rest of
+    # cleanup from running.
+    registry = BridgeSessionRegistry()
+    fake_avatar_session = MagicMock()
+    fake_avatar_session.is_speaking.return_value = False
+    fake_track = MagicMock()
+    fake_stream = _FakeAudioStream([_fake_frame_event()])
+    fake_stream.aclose = AsyncMock(side_effect=RuntimeError("aclose blew up"))
+
+    resolved_future = asyncio.get_running_loop().create_future()
+    resolved_future.set_result(fake_track)
+
+    ctx = _make_ctx("room-5")
+
+    with (
+        patch.object(ep, "_registry", registry),
+        patch.object(ep, "_register_first_audio_track_waiter", return_value=resolved_future),
+        patch.object(ep, "_publish_livekit_audio_track", new=AsyncMock(return_value=MagicMock())),
+        patch.object(
+            ep, "_create_avatar_session", new=AsyncMock(return_value=fake_avatar_session)
+        ),
+        patch.object(ep, "_make_audio_stream", return_value=fake_stream),
+        patch.object(ep.session_manager, "remove_session") as fake_remove,
+    ):
+        # Must not raise/propagate the aclose() failure.
+        await ep.entrypoint(ctx)
+
+    fake_stream.aclose.assert_awaited_once()
+    fake_remove.assert_called_once_with("room-5")
+    ctx.shutdown.assert_called_once()
+    assert registry.acquire("room-5") is True
+    registry.release("room-5")
 
 
 class _HangingAudioStream(_FakeAudioStream):
@@ -515,6 +689,7 @@ async def test_entrypoint_cleans_up_when_task_is_cancelled():
     # completion and an ordinary exception.
     fake_stream.aclose.assert_awaited_once()
     fake_remove.assert_called_once_with("room-4")
+    ctx.shutdown.assert_called_once()
     assert registry.acquire("room-4") is True
     registry.release("room-4")
 
@@ -543,5 +718,6 @@ async def test_entrypoint_cleans_up_when_no_audio_track_ever_arrives():
         await ep.entrypoint(ctx)
 
     fake_remove.assert_called_once_with("room-3")
+    ctx.shutdown.assert_called_once()
     assert registry.acquire("room-3") is True
     registry.release("room-3")

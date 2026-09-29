@@ -180,6 +180,55 @@ background task (preventing a queued-but-not-running
 ``drive_with_text`` call from firing against a torn-down session) but
 cannot stop a call that is already executing inside the executor thread.
 
+At most one drive task in flight per session (code review follow-up finding)
+----------------------------------------------------------------------------------
+Scheduling every completed utterance as its own independent background
+task (the fix directly above) introduced a new problem: nothing stopped
+two of them from running concurrently. ``UtteranceBuffer`` cuts an
+utterance at 500ms of silence, and a user pausing mid-thought — or simply
+an LLM response taking longer than 500ms to *start* producing audio, which
+is common — routinely produces a second completed utterance while the
+first one's ``drive_with_text`` task is still running. The existing
+barge-in check (``is_speech and not was_speech and
+avatar_session.is_speaking()``) does not catch this: it fires on a
+*speech-onset* transition, but ``utterance_buffer.feed()`` only returns a
+completed utterance on a *silence* chunk, and at that point
+``avatar_session.is_speaking()`` may still be ``False`` (the previous
+task's LLM call may not have produced its first audio chunk yet) even
+though its task is very much still running. Left unfixed, both
+``llm_response`` calls run in parallel and both call
+``avatar_session.put_msg_txt`` (``llm.py:62-87``), interleaving two
+answers' TTS fragments into the same session.
+
+Two designs were possible: queue completed utterances and drive them one
+at a time (FIFO), or treat a new utterance completing mid-response as an
+implicit interrupt of that response (supersede). Supersede was chosen:
+this plan's whole interrupt model is built around "the user's most recent
+utterance is the one that matters" (the barge-in check above already
+embodies exactly that policy for the mid-speech case), and a real-time
+conversational avatar answering an ordinary mid-thought pause with a
+disjointed reply to just the fragment before the pause — then, once that
+finishes, *also* replying to the fragment after it — is not better
+behavior than cutting the first (likely-incomplete) response short and
+answering the newer one; unbounded queueing would also let a user who
+keeps pausing accumulate an ever-growing backlog of answers. Neither
+design can fix the deeper cause (``UtteranceBuffer``'s segmentation has
+already split what may have been one continuous thought into two ASR
+calls by the time either sees it) — that is unrelated to this fix.
+
+``_supersede_in_flight_response`` is now the single implementation shared
+by both trigger points (mid-speech barge-in, and a new utterance
+completing while ``pending_tasks`` still holds an unfinished one): it calls
+``pipeline_bridge.interrupt()``, cancels every not-yet-finished pending
+task (``_cancel_pending_drive_tasks`` — same limitation as above: this can
+only stop a task that has not yet reached its ``drive_with_text`` call,
+not one already executing inside the executor thread), and clears the
+output's own queue if it exposes one. ``_process_frame`` calls it before
+starting a new drive task whenever ``pending_tasks`` still contains an
+unfinished one, which — since this is now the only way a task is ever
+added — means at most one drive task is ever in flight per session by
+construction.
+
 The job does not end on its own — ``ctx.shutdown()`` must be called (code review finding)
 ---------------------------------------------------------------------------------------------
 Read ``livekit/agents/ipc/job_proc_lazy_main.py:280-420``: the job task
@@ -203,6 +252,23 @@ cancellation), now call ``ctx.shutdown(reason=...)``
 (``job.py:871-872`` — synchronous, safe to call redundantly: the framework
 suppresses ``asyncio.InvalidStateError`` if the future is already resolved,
 ``job_proc_lazy_main.py:302``).
+
+``aclose()`` is now the *last* thing ``finally`` does (code review follow-up finding)
+------------------------------------------------------------------------------------------
+An earlier version awaited ``audio_stream.aclose()`` first in ``finally``,
+ahead of the session/registry cleanup, wrapped only in
+``except Exception`` — a ``CancelledError`` delivered to this task while
+it was specifically suspended inside that ``await`` would not be caught by
+that ``except Exception`` (``CancelledError`` is a ``BaseException``, not
+an ``Exception``, since Python 3.8), and would propagate out of
+``finally`` before ``session_manager.remove_session``, ``_registry.release``,
+or ``ctx.shutdown()`` ever ran — the same resource-leak risk the
+``aclose()``-try/except fix above was meant to close, just narrowed to one
+specific timing window. Reordered so every synchronous, load-bearing
+cleanup step runs first; ``audio_stream.aclose()`` runs last, still
+wrapped in ``try/except Exception`` for its ordinary-failure case, but
+nothing afterward depends on it succeeding (or, now, on it even being
+reached) any more.
 
 What is verified vs. not — see the Task 8 report
 ---------------------------------------------------
@@ -397,6 +463,43 @@ def _on_drive_task_done(task: "asyncio.Task[None]", pending_tasks: set) -> None:
         logger.error("drive_with_text background task failed", exc_info=exc)
 
 
+def _cancel_pending_drive_tasks(pending_tasks: set) -> None:
+    """Cancel and stop tracking every not-yet-finished drive task.
+
+    Can only stop a task that has not yet reached its
+    ``drive_with_text`` call (or is still awaiting the executor for
+    ``transcribe``) — it cannot interrupt a blocking call already
+    executing inside the executor thread. See module docstring's "at most
+    one drive task in flight" section.
+    """
+    for task in list(pending_tasks):
+        if not task.done():
+            task.cancel()
+        pending_tasks.discard(task)
+
+
+def _supersede_in_flight_response(
+    pipeline_bridge: PipelineBridge, avatar_session, pending_tasks: set
+) -> None:
+    """Stop whatever response is currently being generated/played for a
+    previous utterance, because the user's latest utterance supersedes it.
+
+    Shared by both trigger points that mean the same thing from this
+    connection shell's point of view: a mid-speech barge-in
+    (``avatar_session.is_speaking()`` was true when new speech started),
+    and a new utterance completing while a previous one's drive task is
+    still running (``pending_tasks`` still holds an unfinished one). See
+    module docstring's "at most one drive task in flight" section for why
+    the second case is treated the same as the first rather than queued.
+    """
+    pipeline_bridge.interrupt(avatar_session)
+    _cancel_pending_drive_tasks(pending_tasks)
+    output = getattr(avatar_session, "output", None)
+    clear_queue = getattr(output, "clear_queue", None)
+    if clear_queue is not None:
+        clear_queue()
+
+
 async def _process_frame(
     chunk: np.ndarray,
     *,
@@ -420,7 +523,10 @@ async def _process_frame(
     set owned by the caller so the task is never garbage-collected
     mid-flight and so ``entrypoint``'s ``finally`` block can cancel any
     still-pending ones) rather than awaited here — see module docstring's
-    "frame-iteration loop must not stall" section for why.
+    "frame-iteration loop must not stall" section for why. At most one
+    such task is ever left in flight: if a previous one has not finished
+    by the time a new utterance completes, it is superseded first — see
+    module docstring's "at most one drive task in flight" section.
     """
     if chunk.size == 0:
         return was_speech
@@ -431,19 +537,17 @@ async def _process_frame(
         # still talking. See module docstring's "Interrupt-handling design"
         # section for why this is gated on is_speaking() rather than firing
         # unconditionally.
-        pipeline_bridge.interrupt(avatar_session)
+        _supersede_in_flight_response(pipeline_bridge, avatar_session, pending_tasks)
         utterance_buffer.reset()
-        # Also clear whatever synthesized audio is still queued on the
-        # LiveKit side itself — flush_talk() cannot reach it. See module
-        # docstring's "Interrupt must also clear LiveKit's own audio
-        # backlog" section.
-        output = getattr(avatar_session, "output", None)
-        clear_queue = getattr(output, "clear_queue", None)
-        if clear_queue is not None:
-            clear_queue()
 
     completed_utterance = utterance_buffer.feed(chunk)
     if completed_utterance is not None:
+        if any(not task.done() for task in pending_tasks):
+            # A previous utterance's response is still being generated —
+            # treat this new one as superseding it rather than queueing
+            # behind it.
+            _supersede_in_flight_response(pipeline_bridge, avatar_session, pending_tasks)
+
         task = loop.create_task(
             _drive_avatar_with_transcription(
                 loop, asr_bridge, pipeline_bridge, avatar_session, completed_utterance
@@ -536,24 +640,24 @@ async def entrypoint(ctx: JobContext) -> None:
         # every exit path — normal completion, an exception propagating out
         # of the try body, or this task being cancelled by the framework —
         # and a plain try/finally guarantees that in all three cases.
+        #
+        # Every synchronous, load-bearing cleanup step below runs *before*
+        # audio_stream.aclose() (moved to be the very last thing this block
+        # does — code review follow-up finding): an earlier version awaited
+        # aclose() first, wrapped only in `except Exception`, and a
+        # CancelledError delivered to this task specifically while it was
+        # suspended inside that await (CancelledError is a BaseException,
+        # not an Exception, since Python 3.8 — that except clause would not
+        # have caught it) would have propagated out of `finally` before any
+        # of the cleanup below ever ran. See module docstring's "aclose() is
+        # now the last thing finally does" section.
 
         # Best-effort: stop any not-yet-started background drive task from
         # firing against a session that's about to be torn down. Cannot
         # stop one that is already running inside the executor thread (see
         # module docstring's "frame-iteration loop must not stall" section
         # for the known, separate, out-of-scope llm.py cancellation gap).
-        for task in pending_drive_tasks:
-            task.cancel()
-
-        # aclose() gets its own try/except: if it raises, the session and
-        # registry cleanup below must still run unconditionally — otherwise
-        # a single aclose() failure would leak the GPU render thread and
-        # permanently stick this room to this worker (code review finding).
-        if audio_stream is not None:
-            try:
-                await audio_stream.aclose()
-            except Exception:
-                logger.exception("room '%s': audio_stream.aclose() failed", room_name)
+        _cancel_pending_drive_tasks(pending_drive_tasks)
 
         # Unconditional (not gated on `avatar_session is not None`):
         # session_manager.remove_session is a no-op when room_name was never
@@ -567,7 +671,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # but calling remove_session unconditionally here at least reclaims
         # the dict entry instead of leaking it.
         session_manager.remove_session(room_name)
-        # Released last (not first, unlike the brief's draft ordering): a
+        # Released next (not first, unlike the brief's draft ordering): a
         # session for this room is still being torn down until this line, so
         # releasing the registry after tearing it down — rather than before —
         # shrinks (though, since remove_session is fire-and-forget with
@@ -578,5 +682,17 @@ async def entrypoint(ctx: JobContext) -> None:
         _registry.release(room_name)
         # See module docstring's "the job does not end on its own" section:
         # the entrypoint coroutine returning is not, by itself, enough to
-        # end the job — this call is what actually does.
+        # end the job — this call is what actually does. Placed before
+        # aclose() too: the framework does not act on this until the
+        # current task (i.e. this whole finally block) finishes anyway, so
+        # there is no ordering hazard in calling it early.
         ctx.shutdown(reason="connection shell job finished")
+
+        # Last: nothing below this point is load-bearing for cleanup
+        # anymore, so aclose() failing (or a CancelledError landing here
+        # specifically) no longer risks skipping anything that matters.
+        if audio_stream is not None:
+            try:
+                await audio_stream.aclose()
+            except Exception:
+                logger.exception("room '%s': audio_stream.aclose() failed", room_name)

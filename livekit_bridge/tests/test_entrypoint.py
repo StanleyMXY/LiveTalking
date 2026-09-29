@@ -28,10 +28,16 @@ unit-testable without live infrastructure, and is covered below:
   exception propagating out of the frame loop, task cancellation, the "no
   audio track ever arrived" timeout path, and even when `aclose()` itself
   raises (code review I2/I3); and that the duplicate-dispatch early return
-  also calls `ctx.shutdown()` (code review I2).
+  also calls `ctx.shutdown()` (code review I2);
+- that at most one `drive_with_text`-driving task is ever in flight per
+  session: a new utterance completing while a previous one's response is
+  still being generated supersedes it (cancels the stale task, interrupts
+  the avatar) rather than letting both run concurrently and interleave
+  their TTS output (code review follow-up finding to I1).
 """
 
 import asyncio
+import contextlib
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -491,6 +497,91 @@ async def test_process_frame_does_not_block_caller_on_a_slow_drive_call():
     assert len(pending_tasks) == 1
 
     await asyncio.gather(*pending_tasks)
+
+
+@pytest.mark.asyncio
+async def test_process_frame_supersedes_stale_drive_task_on_new_utterance():
+    # Code review follow-up to I1: scheduling every completed utterance as
+    # an independent background task let two drive_with_text calls run
+    # concurrently with no ordering, interleaving their TTS output. A new
+    # utterance completing while a previous one's response is still being
+    # generated must supersede it (cancel the stale task + interrupt the
+    # avatar + clear the output queue), not queue behind it — see
+    # entrypoint.py's module docstring's "at most one drive task in flight"
+    # section for why supersede was chosen over queueing.
+    avatar_session = MagicMock()
+    avatar_session.is_speaking.return_value = False
+    avatar_session.output = MagicMock(spec=LiveKitOutput)
+    pipeline_bridge = MagicMock()
+    utterance_buffer = MagicMock()
+    utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
+    loop = asyncio.get_running_loop()
+    pending_tasks: set = set()
+
+    # The first utterance's transcribe() blocks (in a real executor thread)
+    # until the test releases it, simulating a response that is still being
+    # generated when the second utterance completes.
+    first_call_release = threading.Event()
+    call_count = {"n": 0}
+
+    def blocking_transcribe(audio):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            first_call_release.wait(timeout=5)
+            return "first"
+        return "second"
+
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.side_effect = blocking_transcribe
+
+    await ep._process_frame(
+        _make_chunk(is_speech=False),
+        was_speech=False,
+        utterance_buffer=utterance_buffer,
+        asr_bridge=asr_bridge,
+        pipeline_bridge=pipeline_bridge,
+        avatar_session=avatar_session,
+        loop=loop,
+        pending_tasks=pending_tasks,
+    )
+    await asyncio.sleep(0.05)  # let the task actually start running transcribe
+    assert len(pending_tasks) == 1
+    first_task = next(iter(pending_tasks))
+    assert not first_task.done()
+
+    # Second utterance completes while the first is still in flight.
+    await ep._process_frame(
+        _make_chunk(is_speech=False),
+        was_speech=False,
+        utterance_buffer=utterance_buffer,
+        asr_bridge=asr_bridge,
+        pipeline_bridge=pipeline_bridge,
+        avatar_session=avatar_session,
+        loop=loop,
+        pending_tasks=pending_tasks,
+    )
+
+    # The stale task must have had cancellation requested, and the avatar
+    # told to interrupt (flush_talk + clear_queue), before the second task
+    # started — proven by cancelling()/pending state rather than waiting
+    # for the blocked executor thread to actually unwind.
+    assert first_task.cancelling() > 0
+    pipeline_bridge.interrupt.assert_called_once_with(avatar_session)
+    avatar_session.output.clear_queue.assert_called_once()
+    assert len(pending_tasks) == 1
+    second_task = next(iter(pending_tasks))
+    assert second_task is not first_task
+
+    first_call_release.set()  # release the blocked executor thread
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.gather(first_task, return_exceptions=True)
+    assert first_task.cancelled()
+    # The cancelled first task's transcribe result ("first") must never
+    # have reached drive_with_text.
+    pipeline_bridge.drive_with_text.assert_not_called()
+
+    await asyncio.gather(second_task)
+    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "second")
 
 
 # ─── entrypoint(): dedup + cleanup on every exit path ───────────────────

@@ -68,8 +68,9 @@ proxy, ``_SupersedableAvatarProxy``, instead of the raw ``avatar_session``.
 The proxy forwards ``.opt`` straight through, but every ``put_msg_txt``
 call first checks whether *this specific call's* generation — a
 monotonically increasing counter on the bridge, incremented once per
-``drive_with_text`` call and, critically, also once per ``interrupt()``
-call — is still the bridge's current one; if a newer utterance has since
+``begin_generation()`` call (one per dispatched ``drive_with_text``) and,
+critically, also once per ``interrupt()`` call — is still the bridge's
+current one; if a newer utterance has since
 superseded it, the call becomes a silent no-op instead of reaching the
 real ``avatar_session``. This actually stops the interleaving at its
 source (each individual enqueue attempt), rather than only ever having a
@@ -81,6 +82,44 @@ unchanged alongside this — it is still correct and useful for the
 stage-1 (still-in-``transcribe``) case, and for not wasting executor
 capacity even starting a ``drive_with_text`` call that would immediately
 no-op anyway.
+
+Round 4: the two cross-thread races the first version of the fence left open
+-------------------------------------------------------------------------------
+A code review traced the lock/thread semantics of the first version and
+found two check-then-act windows, both now closed:
+
+Gap 1 — check and forward were two steps. The proxy took the lock, checked
+its generation, *released* the lock, then forwarded. ``interrupt()`` (event
+loop thread) could run bump-then-flush entirely inside that gap, after which
+the stale thread's forward landed in the freshly flushed queue, ahead of the
+next answer. Now ``_forward_if_current`` holds the lock across both the check
+and ``avatar_session.put_msg_txt(...)``, and ``interrupt()``'s bump takes the
+same lock — so a forward either finished before the bump (and is removed by
+the flush that follows) or starts after it (and is rejected). Holding the
+lock across the forward is safe because the real ``put_msg_txt`` path only
+does dict lookups and an unbounded, non-blocking ``Queue.put``
+(``avatars/base_avatar.py:158-165``, ``tts/base_tts.py:27,34-36``) and never
+calls back into this bridge.
+
+Gap 2 — the generation was allocated on the executor worker thread, inside
+``drive_with_text``. If ``interrupt()`` ran on the event loop after the call
+had been dispatched but before the worker reached the allocation, the stale
+call allocated a number *newer* than the interrupt's bump and ran unfenced.
+Now the dispatcher (``entrypoint._drive_avatar_with_transcription``) calls
+``begin_generation()`` on the event-loop thread before ``run_in_executor``
+and passes the result into ``drive_with_text(avatar_session, text,
+generation)``, which never allocates one itself. Allocation and
+``interrupt()`` both run on the one event-loop thread, so they are totally
+ordered: an interrupt that lands after dispatch always invalidates it.
+
+With both fixed, "every ``put_msg_txt`` a superseded call makes afterward is
+a no-op" holds without a timing caveat. The one remaining boundary is
+inherent, not a race: a fragment already forwarded *before* the supersede is
+in the TTS queue, and is removed by ``interrupt()``'s ``flush_talk()`` — or,
+in the supersede-by-new-utterance path, also by that same ``interrupt()``,
+since ``entrypoint._supersede_in_flight_response`` always calls it. (TTS
+audio already synthesized past that queue is cleared separately by
+``LiveKitOutput.clear_queue`` in the same function.)
 """
 
 import threading
@@ -95,12 +134,28 @@ class PipelineBridge:
         self._generation_lock = threading.Lock()
         self._current_generation = 0
 
-    def drive_with_text(self, avatar_session, text: str) -> None:
-        if not text or not text.strip():
-            return
+    def begin_generation(self) -> int:
+        """Allocate a new generation, superseding every earlier one.
+
+        Must be called on the event-loop thread, *before* the matching
+        ``drive_with_text`` call is dispatched to an executor — see module
+        docstring's "Round 4" section for why allocating it on the worker
+        thread instead leaves a window where a stale call can come out
+        looking current.
+        """
         with self._generation_lock:
             self._current_generation += 1
-            generation = self._current_generation
+            return self._current_generation
+
+    def drive_with_text(self, avatar_session, text: str, generation: int) -> None:
+        """Run ``llm_response`` for ``text`` fenced to ``generation``.
+
+        ``generation`` must come from ``begin_generation()``, called by the
+        dispatcher on the event-loop thread before this (blocking) call was
+        handed to an executor — this method never allocates one itself.
+        """
+        if not text or not text.strip():
+            return
         proxy = _SupersedableAvatarProxy(avatar_session, self, generation)
         llm_response(text, proxy, {})
 
@@ -110,13 +165,30 @@ class PipelineBridge:
         # interrupt(), not just a superseding drive_with_text call, must
         # stop an orphaned llm_response call's future put_msg_txt calls
         # from reaching the real session.
+        #
+        # The bump waits for any in-progress fenced forward to finish
+        # (_forward_if_current holds this same lock across its check and
+        # its forward), so every forward either completed before the bump
+        # — and is removed by the flush below — or starts after it and is
+        # rejected. flush_talk() itself runs outside the lock: no new
+        # generation can start forwarding between the bump and the flush,
+        # because generations are only allocated by begin_generation() on
+        # the event-loop thread, the same thread this runs on.
         with self._generation_lock:
             self._current_generation += 1
         avatar_session.flush_talk()
 
-    def _is_current_generation(self, generation: int) -> bool:
+    def _forward_if_current(self, generation: int, avatar_session, msg, datainfo) -> None:
+        # Check and forward are one critical section (module docstring's
+        # "Round 4" section, Gap 1). Safe to hold the lock across the
+        # forward: the real avatar_session.put_msg_txt only does dict
+        # lookups and an unbounded, non-blocking Queue.put
+        # (avatars/base_avatar.py:158-165, tts/base_tts.py:34-36), and
+        # never calls back into this bridge.
         with self._generation_lock:
-            return generation == self._current_generation
+            if generation != self._current_generation:
+                return
+            avatar_session.put_msg_txt(msg, datainfo)
 
 
 class _SupersedableAvatarProxy:
@@ -141,6 +213,9 @@ class _SupersedableAvatarProxy:
         return self._avatar_session.opt
 
     def put_msg_txt(self, msg, datainfo=None) -> None:
-        if not self._bridge._is_current_generation(self._generation):
-            return
-        self._avatar_session.put_msg_txt(msg, {} if datainfo is None else datainfo)
+        self._bridge._forward_if_current(
+            self._generation,
+            self._avatar_session,
+            msg,
+            {} if datainfo is None else datainfo,
+        )

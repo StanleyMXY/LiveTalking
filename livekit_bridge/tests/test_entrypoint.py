@@ -399,7 +399,7 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
         call_threads["transcribe"] = threading.get_ident()
         return "hello"
 
-    def fake_drive_with_text(avatar_session, text):
+    def fake_drive_with_text(avatar_session, text, generation):
         call_threads["drive_with_text"] = threading.get_ident()
 
     avatar_session = MagicMock()
@@ -407,6 +407,7 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
     asr_bridge = MagicMock()
     asr_bridge.transcribe.side_effect = fake_transcribe
     pipeline_bridge = MagicMock()
+    pipeline_bridge.begin_generation.return_value = 7
     pipeline_bridge.drive_with_text.side_effect = fake_drive_with_text
     utterance_buffer = MagicMock()
     utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
@@ -431,7 +432,7 @@ async def test_process_frame_offloads_blocking_calls_to_executor_not_event_loop(
 
     assert call_threads.get("transcribe") not in (None, main_thread_id)
     assert call_threads.get("drive_with_text") not in (None, main_thread_id)
-    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "hello")
+    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "hello", 7)
 
 
 @pytest.mark.asyncio
@@ -532,6 +533,7 @@ async def test_process_frame_supersedes_stale_drive_task_on_new_utterance():
     avatar_session.is_speaking.return_value = False
     avatar_session.output = MagicMock(spec=LiveKitOutput)
     pipeline_bridge = MagicMock()
+    pipeline_bridge.begin_generation.return_value = 2
     utterance_buffer = MagicMock()
     utterance_buffer.feed.return_value = np.zeros(320, dtype=np.float32)
     loop = asyncio.get_running_loop()
@@ -600,7 +602,103 @@ async def test_process_frame_supersedes_stale_drive_task_on_new_utterance():
     pipeline_bridge.drive_with_text.assert_not_called()
 
     await asyncio.gather(second_task)
-    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "second")
+    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "second", 2)
+    # Only the task that actually reached the drive stage allocated a
+    # generation; the cancelled one never got that far.
+    pipeline_bridge.begin_generation.assert_called_once_with()
+
+
+# ─── _drive_avatar_with_transcription: generation allocated on the loop ─
+
+
+@pytest.mark.asyncio
+async def test_drive_generation_is_allocated_on_event_loop_before_executor_dispatch():
+    # Round 4, Gap 2 (pipeline_bridge.py module docstring): the drive
+    # call's generation must be allocated on the event-loop thread, before
+    # run_in_executor dispatches drive_with_text — not on the worker — and
+    # the pre-allocated value must be what drive_with_text receives.
+    loop_thread_id = threading.get_ident()
+    events = []
+
+    def fake_begin_generation():
+        events.append(("begin_generation", threading.get_ident()))
+        return 41
+
+    def fake_drive_with_text(avatar_session, text, generation):
+        events.append(("drive_with_text", threading.get_ident()))
+
+    pipeline_bridge = MagicMock()
+    pipeline_bridge.begin_generation.side_effect = fake_begin_generation
+    pipeline_bridge.drive_with_text.side_effect = fake_drive_with_text
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.return_value = "hi"
+    avatar_session = MagicMock()
+
+    await ep._drive_avatar_with_transcription(
+        asyncio.get_running_loop(),
+        asr_bridge,
+        pipeline_bridge,
+        avatar_session,
+        np.zeros(320, dtype=np.float32),
+    )
+
+    assert [name for name, _ in events] == ["begin_generation", "drive_with_text"]
+    assert events[0][1] == loop_thread_id
+    assert events[1][1] != loop_thread_id
+    pipeline_bridge.drive_with_text.assert_called_once_with(avatar_session, "hi", 41)
+
+
+class _DispatchGatedLoop:
+    """Wraps the real running loop so the test can hold a drive_with_text
+    call in the "dispatched, but no worker has started it yet" state — the
+    exact window Gap 2 is about — without replacing the executor itself."""
+
+    def __init__(self, real_loop):
+        self._real_loop = real_loop
+        self.drive_dispatched = asyncio.Event()
+        self.release_drive = asyncio.Event()
+
+    async def run_in_executor(self, executor, func, *args):
+        if getattr(func, "__name__", None) == "drive_with_text":
+            self.drive_dispatched.set()
+            await self.release_drive.wait()
+        return await self._real_loop.run_in_executor(executor, func, *args)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_between_dispatch_and_worker_start_fences_the_real_bridge():
+    # Gap 2 end to end, with the real PipelineBridge: a drive call is
+    # dispatched, interrupt() lands on the event loop before the worker
+    # runs it, and only then does the worker run drive_with_text. The
+    # llm_response it runs must not reach the real session. When
+    # drive_with_text allocated its generation on the worker (pre-fix), the
+    # allocation came after the interrupt's bump and this fragment got
+    # through.
+    from livekit_bridge.pipeline_bridge import PipelineBridge
+
+    bridge = PipelineBridge()
+    session = MagicMock()
+    asr_bridge = MagicMock()
+    asr_bridge.transcribe.return_value = "hi"
+    gated_loop = _DispatchGatedLoop(asyncio.get_running_loop())
+
+    def fake_llm_response(message, proxy, datainfo):
+        proxy.put_msg_txt("fragment from a superseded call", {})
+
+    with patch("livekit_bridge.pipeline_bridge.llm_response", side_effect=fake_llm_response):
+        drive = asyncio.ensure_future(
+            ep._drive_avatar_with_transcription(
+                gated_loop, asr_bridge, bridge, session, np.zeros(320, dtype=np.float32)
+            )
+        )
+        await asyncio.wait_for(gated_loop.drive_dispatched.wait(), timeout=5)
+
+        bridge.interrupt(session)  # event loop: lands before the worker runs
+        gated_loop.release_drive.set()
+        await asyncio.wait_for(drive, timeout=5)
+
+    session.flush_talk.assert_called_once()
+    session.put_msg_txt.assert_not_called()
 
 
 # ─── entrypoint(): dedup + cleanup on every exit path ───────────────────

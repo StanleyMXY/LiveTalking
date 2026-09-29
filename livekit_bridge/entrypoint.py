@@ -473,9 +473,20 @@ async def _drive_avatar_with_transcription(
     LiveKit's own async event handling for the duration of each
     inference/LLM call, and would stall frame draining (hence interrupt
     detection) for the whole LLM response on top of that.
+
+    The drive call's generation is allocated *here*, on the event-loop
+    thread, before ``run_in_executor`` hands the call to a worker — not by
+    ``drive_with_text`` on the worker. ``pipeline_bridge.interrupt()`` also
+    runs on this thread (via ``_supersede_in_flight_response``), so the two
+    are totally ordered: an interrupt that lands after this dispatch always
+    invalidates it, even if the worker has not started running yet. See
+    ``pipeline_bridge.py``'s module docstring, "Round 4", Gap 2.
     """
     text = await loop.run_in_executor(None, asr_bridge.transcribe, audio)
-    await loop.run_in_executor(None, pipeline_bridge.drive_with_text, avatar_session, text)
+    generation = pipeline_bridge.begin_generation()
+    await loop.run_in_executor(
+        None, pipeline_bridge.drive_with_text, avatar_session, text, generation
+    )
 
 
 def _on_drive_task_done(task: "asyncio.Task[None]", pending_tasks: set) -> None:

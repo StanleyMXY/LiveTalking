@@ -29,11 +29,19 @@ unit-testable without live infrastructure, and is covered below:
   audio track ever arrived" timeout path, and even when `aclose()` itself
   raises (code review I2/I3); and that the duplicate-dispatch early return
   also calls `ctx.shutdown()` (code review I2);
-- that at most one `drive_with_text`-driving task is ever in flight per
-  session: a new utterance completing while a previous one's response is
-  still being generated supersedes it (cancels the stale task, interrupts
-  the avatar) rather than letting both run concurrently and interleave
-  their TTS output (code review follow-up finding to I1).
+- that at most one *tracked* `drive_with_text`-driving task is ever left
+  in `pending_tasks` per session: a new utterance completing while a
+  previous one's response is still being generated supersedes it (cancels
+  the stale task, calls `pipeline_bridge.interrupt()`) rather than letting
+  both run concurrently (code review follow-up finding to I1). What this
+  file does *not* prove on its own — because it genuinely cannot, without
+  reaching into `PipelineBridge`'s own generation-fencing — is that an
+  already-executing `llm_response` call (the case where cancelling the
+  asyncio task has no effect, since that call is running in its own
+  executor thread with no cancellation checkpoint) is actually stopped
+  from reaching the real session; that guarantee is tested directly in
+  `test_pipeline_bridge.py` instead (see its
+  `test_superseded_call_cannot_reach_real_session_after_new_drive_call`).
 """
 
 import asyncio
@@ -507,8 +515,19 @@ async def test_process_frame_supersedes_stale_drive_task_on_new_utterance():
     # utterance completing while a previous one's response is still being
     # generated must supersede it (cancel the stale task + interrupt the
     # avatar + clear the output queue), not queue behind it — see
-    # entrypoint.py's module docstring's "at most one drive task in flight"
-    # section for why supersede was chosen over queueing.
+    # entrypoint.py's module docstring's "at most one *tracked* drive task
+    # per session" section for why supersede was chosen over queueing.
+    #
+    # This test only exercises the case where the stale task is still
+    # awaiting transcribe() (stage 1) when superseded — cancellation alone
+    # is sufficient there, since the coroutine never resumes to reach
+    # drive_with_text. It deliberately does NOT prove the harder case (a
+    # stale task already executing llm_response in its own executor
+    # thread, where cancelling the asyncio task has no effect) is handled
+    # — that guarantee comes from PipelineBridge's own generation fencing,
+    # not from anything in this module, and is proven directly in
+    # test_pipeline_bridge.py's
+    # test_superseded_call_cannot_reach_real_session_after_new_drive_call.
     avatar_session = MagicMock()
     avatar_session.is_speaking.return_value = False
     avatar_session.output = MagicMock(spec=LiveKitOutput)

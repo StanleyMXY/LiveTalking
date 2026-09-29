@@ -180,8 +180,8 @@ background task (preventing a queued-but-not-running
 ``drive_with_text`` call from firing against a torn-down session) but
 cannot stop a call that is already executing inside the executor thread.
 
-At most one drive task in flight per session (code review follow-up finding)
-----------------------------------------------------------------------------------
+At most one *tracked* drive task per session — but that alone does not stop interleaving (code review follow-up finding, corrected below)
+------------------------------------------------------------------------------------------------------------------------------------------------
 Scheduling every completed utterance as its own independent background
 task (the fix directly above) introduced a new problem: nothing stopped
 two of them from running concurrently. ``UtteranceBuffer`` cuts an
@@ -220,14 +220,38 @@ calls by the time either sees it) — that is unrelated to this fix.
 by both trigger points (mid-speech barge-in, and a new utterance
 completing while ``pending_tasks`` still holds an unfinished one): it calls
 ``pipeline_bridge.interrupt()``, cancels every not-yet-finished pending
-task (``_cancel_pending_drive_tasks`` — same limitation as above: this can
-only stop a task that has not yet reached its ``drive_with_text`` call,
-not one already executing inside the executor thread), and clears the
-output's own queue if it exposes one. ``_process_frame`` calls it before
-starting a new drive task whenever ``pending_tasks`` still contains an
-unfinished one, which — since this is now the only way a task is ever
-added — means at most one drive task is ever in flight per session by
-construction.
+task (``_cancel_pending_drive_tasks``), and clears the output's own queue
+if it exposes one. ``_process_frame`` calls it before starting a new drive
+task whenever ``pending_tasks`` still contains an unfinished one, which
+means at most one *asyncio Task* is ever tracked in ``pending_tasks`` per
+session by construction.
+
+That is **not** the same as "at most one response is ever being generated"
+— an earlier version of this docstring conflated the two, which a code
+review caught as actively misleading. Cancelling the asyncio ``Task``
+only has an effect if the cancellation lands while it is still awaiting
+``asr_bridge.transcribe`` (stage 1): the coroutine then never resumes to
+reach ``drive_with_text`` (stage 2), so nothing further happens. But once
+a task has already reached stage 2 and ``llm_response`` is executing
+inside its own executor thread, cancelling the asyncio side does nothing
+to that thread — ``llm_response`` has no cancellation checkpoint anywhere
+in its streaming loop and keeps calling ``avatar_session.put_msg_txt``
+regardless. Given this plan's own timing (a 500ms silence cut vs.
+realistic LLM response latency), reaching stage 2 before a superseding
+utterance completes is the *common* case, not a rare one — so asyncio-side
+cancellation alone does not actually stop the interleaving in the case
+that matters most. What actually stops it is
+``PipelineBridge``'s own generation-fencing (see ``pipeline_bridge.py``'s
+module docstring): ``drive_with_text`` passes a per-call proxy instead of
+the real ``avatar_session``, and ``interrupt()`` (called by
+``_supersede_in_flight_response`` above) invalidates that proxy's
+generation, turning every ``put_msg_txt`` call an orphaned, still-running
+``llm_response`` invocation tries to make afterward into a silent no-op —
+regardless of which stage its task had reached. The asyncio-level
+cancellation kept here is still worth doing (it is correct for the stage-1
+case, and avoids wasting executor capacity starting a call that would
+immediately no-op anyway) — it just is not, on its own, what makes
+superseding actually work.
 
 The job does not end on its own — ``ctx.shutdown()`` must be called (code review finding)
 ---------------------------------------------------------------------------------------------
@@ -470,7 +494,10 @@ def _cancel_pending_drive_tasks(pending_tasks: set) -> None:
     ``drive_with_text`` call (or is still awaiting the executor for
     ``transcribe``) — it cannot interrupt a blocking call already
     executing inside the executor thread. See module docstring's "at most
-    one drive task in flight" section.
+    one *tracked* drive task per session" section — actually stopping an
+    already-executing ``llm_response`` call from reaching the real
+    session is ``PipelineBridge``'s job (its generation fencing), not
+    this function's.
     """
     for task in list(pending_tasks):
         if not task.done():
@@ -489,8 +516,13 @@ def _supersede_in_flight_response(
     (``avatar_session.is_speaking()`` was true when new speech started),
     and a new utterance completing while a previous one's drive task is
     still running (``pending_tasks`` still holds an unfinished one). See
-    module docstring's "at most one drive task in flight" section for why
-    the second case is treated the same as the first rather than queued.
+    module docstring's "at most one *tracked* drive task per session"
+    section for why the second case is treated the same as the first
+    rather than queued, and for why cancelling the pending task here is
+    necessary but not sufficient — ``pipeline_bridge.interrupt()`` is what
+    actually stops an already-executing ``llm_response`` call from
+    reaching the real session, via ``PipelineBridge``'s own generation
+    fencing (``pipeline_bridge.py``'s module docstring).
     """
     pipeline_bridge.interrupt(avatar_session)
     _cancel_pending_drive_tasks(pending_tasks)
@@ -523,10 +555,13 @@ async def _process_frame(
     set owned by the caller so the task is never garbage-collected
     mid-flight and so ``entrypoint``'s ``finally`` block can cancel any
     still-pending ones) rather than awaited here — see module docstring's
-    "frame-iteration loop must not stall" section for why. At most one
-    such task is ever left in flight: if a previous one has not finished
-    by the time a new utterance completes, it is superseded first — see
-    module docstring's "at most one drive task in flight" section.
+    "frame-iteration loop must not stall" section for why. At most one such
+    *task* is ever left tracked: if a previous one has not finished by the
+    time a new utterance completes, it is superseded first (cancelled, and
+    — the part that actually stops it from reaching the real session even
+    if it had already started calling the LLM — its
+    ``PipelineBridge``-issued proxy invalidated) — see module docstring's
+    "at most one *tracked* drive task per session" section.
     """
     if chunk.size == 0:
         return was_speech

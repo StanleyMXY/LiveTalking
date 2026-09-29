@@ -56,3 +56,6 @@ dashscope
 # Optional: remove these lines if you don't need local ASR
 #funasr
 #modelscope
+
+# LiveKit connection shell (livekit_bridge/) — provides livekit.rtc
+livekit==1.1.20

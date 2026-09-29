@@ -57,8 +57,21 @@ dashscope
 #funasr
 #modelscope
 
-# LiveKit connection shell (livekit_bridge/) — provides livekit.rtc
-livekit==1.1.20
+# LiveKit connection shell (livekit_bridge/) — provides livekit.rtc.
+# Was livekit==1.1.20 (Task 1). Task 8 added livekit-agents below, and
+# livekit-agents==1.8.3 pins livekit==1.1.18 *exactly* (checked against
+# PyPI's published metadata for every 1.x livekit-agents release currently
+# available — every one of them pins an exact livekit== version, none of
+# which is 1.1.20), so `pip install livekit-agents` forces this downgrade.
+# Verified safe before accepting it: diffed livekit/rtc/audio_frame.py and
+# livekit/rtc/audio_stream.py (the only two files this project's Task 1/2/4
+# facts depend on) between the 1.1.20 and 1.1.18 wheels — byte-identical.
+livekit==1.1.18
+
+# LiveKit connection shell (livekit_bridge/entrypoint.py, worker_app.py) —
+# Task 8: worker/JobContext/entrypoint-registration framework. Latest
+# available at install time per `pip index versions livekit-agents`.
+livekit-agents==1.8.3
 
 # Testing: tests/test_livekit_output.py uses @pytest.mark.asyncio
 pytest-asyncio

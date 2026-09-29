@@ -1,6 +1,6 @@
 """
 livekit_bridge.worker_app — launch script for this connection shell's
-LiveKit Agent worker process (Task 8's "启动脚本" deliverable).
+LiveKit Agent worker process.
 
 Why a separate process at all
 ------------------------------
@@ -10,7 +10,7 @@ livekit-agents worker are two different long-running programs (one serves
 the other registers with the LiveKit server and waits for job dispatch via
 ``cli.run_app``); neither returns control to the other, so they cannot live
 in the same call stack. They *can* share the same Python venv/environment
-(the brief's requirement), which is all this script relies on: it imports
+(a requirement of the plan), which is all this script relies on: it imports
 ``app``, ``server.session_manager``, and ``config`` exactly as app.py does,
 just without ever calling ``app.main()`` (which would also start the HTTP
 server this worker does not need).
@@ -83,8 +83,9 @@ What was not exercised in this environment
 ----------------------------------------------
 This dev machine is Windows. ``JobExecutorType.THREAD`` is pinned
 explicitly below (not left at the platform default), so the thread-per-job
-behavior described above is exercised by reading the source, not by
-actually dispatching a real job in this session — see the Task 8 report.
+behavior described above is established by reading the source, not by
+actually dispatching a real job — see ``livekit_bridge/__init__.py``'s
+"Known limitations".
 The ``JobExecutorType.PROCESS`` path (a genuine subprocess per job,
 relevant if a future change ever needs it) was verified only by reading
 ``job_proc_executor.py``/``proc_pool.py``'s source, not by running it.
@@ -213,9 +214,10 @@ def _load_and_wire_pipeline() -> None:
     # thread starts. The unavoidable cost: BaseAvatar.__init__ logs one
     # ERROR-level "Output transport livekit not found in map." line per
     # session. Harmless (self.output is simply left unset, and we set it
-    # ourselves immediately after) but noisy — see the Task 8 report for why
-    # this could not be silenced without editing avatars/base_avatar.py,
-    # which is out of this task's scope.
+    # ourselves immediately after) but noisy; it cannot be silenced without
+    # editing avatars/base_avatar.py, which this branch deliberately does
+    # not touch (new code is confined to livekit_bridge/ and
+    # streamout/livekit_output.py).
     opt.transport = "livekit"
 
     model, global_avatars, load_avatar = _load_avatar_pipeline(opt)
@@ -255,9 +257,11 @@ def _build_worker_options() -> WorkerOptions:
         # all. THREAD keeps every job in this one process, sharing the one
         # model already loaded above, at the cost of losing livekit-agents'
         # normal per-job process-crash isolation (an unhandled crash in
-        # one job's code can now affect others in the same process). See
-        # the Task 8 report: this tradeoff should be confirmed by a human
-        # before shipping, not treated as settled by this comment alone.
+        # one job's code can now affect others in the same process), and
+        # it makes session_manager's unlocked capacity check-then-increment
+        # a real cross-thread race. This tradeoff must be confirmed by a
+        # human before shipping — see livekit_bridge/__init__.py's "Known
+        # limitations" (THREAD vs PROCESS, and worker capacity signaling).
         job_executor_type=JobExecutorType.THREAD,
     )
 

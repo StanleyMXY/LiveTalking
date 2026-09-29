@@ -24,11 +24,12 @@ PipelineBridge — 文字驱动桥接。
   ``datainfo.get('tts', {}).get('backend', ...)``——如果传 ``None`` 进去，
   这里会直接 ``AttributeError: 'NoneType' object has no attribute 'get'``。
   规划阶段草稿里的 ``datainfo=None`` 是没有核实过的错误猜测，会在真实调用链里崩溃。
-- 本桥接类没有 aiohttp 的 ``request.app`` 注册表可用，且 brief 要求的接口是
-  ``drive_with_text(avatar_session, text) -> None``（没有 tts 透传参数），
-  所以直接 ``from llm import llm_response`` 导入同一个函数对象，并传入空字典
-  ``{}`` 作为 ``datainfo``——这与 routes.py 在没有 ``tts`` 参数时构造的
-  ``datainfo = {}`` 完全一致。
+- 本桥接类没有 aiohttp 的 ``request.app`` 注册表可用，且接口是
+  ``drive_with_text(avatar_session, text, generation) -> None``（没有 tts
+  透传参数；``generation`` 由调度方事先通过 ``begin_generation()`` 分配，
+  见下文 "Round 4" 一节），所以直接 ``from llm import llm_response`` 导入同一个
+  函数对象，并传入空字典 ``{}`` 作为 ``datainfo``——这与 routes.py 在没有
+  ``tts`` 参数时构造的 ``datainfo = {}`` 完全一致。
 - ``interrupt()`` 对应 ``/human`` 路由里 ``params.get('interrupt')`` 分支
   (server/routes.py:62-63) 和独立的 ``/interrupt_talk`` 路由
   (server/routes.py:84-96)，两处都是直接调用 ``avatar_session.flush_talk()``。
@@ -37,8 +38,8 @@ Generation fencing (code review follow-up finding — why ``drive_with_text``
 no longer passes the raw ``avatar_session`` straight through)
 -----------------------------------------------------------------------------------------
 ``entrypoint.py``'s connection shell can supersede an in-flight response
-when a new utterance completes before the previous one has finished (see
-that module's "at most one *tracked* drive task per session" docstring
+whenever a newer meaningful utterance arrives (see that module's "Every
+meaningful utterance supersedes the previous response" docstring
 section). The first attempt at this cancelled the *asyncio* ``Task`` that
 was awaiting
 ``drive_with_text`` — which only helps if cancellation lands while that

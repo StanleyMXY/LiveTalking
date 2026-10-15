@@ -37,7 +37,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription,RTCIceServer,RTCConf
 from aiortc.rtcrtpsender import RTCRtpSender
 from server.webrtc import HumanPlayer
 from avatars.base_avatar import BaseAvatar
-from llm import llm_response
+from llm import llm_response, warmup as warmup_llm
 import registry
 from server.routes import setup_routes
 from server.rtc_manager import RTCManager
@@ -173,6 +173,7 @@ def main():
     #############################################################################
     appasync = web.Application(client_max_size=1024**2*100)
     appasync["llm_response"] = llm_response
+    Thread(target=warmup_llm, args=(opt,), name="llm-warmup", daemon=True).start()
     appasync["opt"] = opt
     appasync["rtc_manager"] = rtc_manager
 

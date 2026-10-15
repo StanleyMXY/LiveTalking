@@ -149,6 +149,11 @@
             border-left: 4px solid #8bc34a;
         }
 
+        .notice-message {
+            background-color: #fff8e1;
+            border-left: 4px solid #ffb300;
+        }
+
         .recording-indicator {
             position: absolute;
             top: 15px;
@@ -368,7 +373,7 @@
                                         </div>
                                         <div class="form-check form-check-inline">
                                             <input class="form-check-input" type="radio" name="asr-mode" id="asr-mode-browser" value="browser">
-                                            <label class="form-check-label" for="asr-mode-browser">浏览器语音识别</label>
+                                            <label class="form-check-label" for="asr-mode-browser">浏览器语音识别（国内网络可能不可用）</label>
                                         </div>
                                     </div>
                                     <div class="col-md-6 mb-3">
@@ -447,7 +452,10 @@
                                 
                                 <form id="chat-form">
                                     <div class="input-group mb-3">
-                                        <textarea class="form-control" id="chat-message" rows="3" placeholder="输入您想对数字人说的话..."></textarea>
+                                        <textarea class="form-control" id="chat-message" rows="3" placeholder="输入您想对数字人说的话...（回车发送，Shift+回车换行）"></textarea>
+                                        <button class="btn btn-outline-secondary" type="button" id="btn-interrupt" title="打断数字人说话">
+                                            <i class="bi bi-hand-index-thumb"></i> 打断
+                                        </button>
                                         <button class="btn btn-primary" type="submit">
                                             <i class="bi bi-send"></i> 发送
                                         </button>
@@ -523,20 +531,106 @@
                 }
             }
 
-            // 添加聊天消息
+            // ===== 连接状态、消息、会话 =====
+            // isConnected 以 RTCPeerConnection.connectionState 为准（client.js 回调），
+            // 不再靠轮询视频画面去猜。
+            let isConnected = false;
+            let currentAvatarBubble = null;   // 本轮数字人回复的气泡，/sse 的 reply 事件往里追加文字
+            let lastNotice = { text: '', at: 0 };
+            let connectTimer = null;
+
             function addChatMessage(message, type = 'user') {
-                const messagesContainer = $('#chat-messages');
-                const messageClass = type === 'user' ? 'user-message' : 'system-message';
-                const sender = type === 'user' ? '您' : '数字人';
-                
-                const messageElement = $(`
-                    <div class="asr-text ${messageClass}">
-                        ${sender}: ${message}
-                    </div>
-                `);
-                
-                messagesContainer.append(messageElement);
-                messagesContainer.scrollTop(messagesContainer[0].scrollHeight);
+                const senders = { user: '您', avatar: '数字人', system: '系统' };
+                const classes = { user: 'user-message', avatar: 'system-message', system: 'notice-message' };
+                const $el = $('<div>').addClass('asr-text ' + (classes[type] || 'notice-message'));
+                // 用 .text()：用户输入和服务端返回的内容都不能当 HTML 解析
+                $el.text((senders[type] || '系统') + ': ' + message);
+                const $box = $('#chat-messages');
+                $box.append($el);
+                $box.scrollTop($box[0].scrollHeight);
+                return $el;
+            }
+
+            // 系统提示；同一句话 5 秒内不重复（每句合成失败都会上报一次）
+            function addNotice(message) {
+                const now = Date.now();
+                if (message === lastNotice.text && now - lastNotice.at < 5000) return;
+                lastNotice = { text: message, at: now };
+                addChatMessage(message, 'system');
+            }
+
+            function addAvatarText(text) {
+                if (!text) return;
+                if (!currentAvatarBubble) currentAvatarBubble = addChatMessage('', 'avatar');
+                currentAvatarBubble.text(currentAvatarBubble.text() + text);
+                const $box = $('#chat-messages');
+                $box.scrollTop($box[0].scrollHeight);
+            }
+
+            let eventSource = null;
+            function openEventStream(sessionid) {
+                closeEventStream();
+                eventSource = new EventSource('/sse?sessionid=' + encodeURIComponent(sessionid));
+                eventSource.onmessage = function(e) {
+                    let msg;
+                    try { msg = JSON.parse(e.data); } catch (err) { return; }
+                    if (msg.status === 'reply') {
+                        addAvatarText(msg.text);
+                    } else if (msg.status === 'llm_error' || msg.status === 'tts_error') {
+                        addNotice(msg.text);
+                    }
+                };
+            }
+            function closeEventStream() {
+                if (eventSource) { eventSource.close(); eventSource = null; }
+            }
+
+            function currentSessionId() {
+                return String(document.getElementById('sessionid').value);
+            }
+
+            function requireConnection() {
+                if (isConnected && currentSessionId() !== '0') return true;
+                addNotice('请先点击"开始连接"，等状态变为"已连接"后再操作。');
+                return false;
+            }
+
+            // 所有对服务器的 POST 都走这里：HTTP 错误和 {code != 0} 都要让人看见
+            function postJson(url, payload) {
+                return fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }).then(function(res) {
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    return res.json();
+                }).then(function(body) {
+                    if (body.code !== 0) throw new Error(body.msg || '服务器返回错误');
+                    return body;
+                }).catch(function(err) {
+                    addNotice('操作失败: ' + err.message);
+                    throw err;
+                });
+            }
+
+            // 发给数字人一段文字（type: chat 走大模型，echo 原样朗读）；没连接时返回 false
+            function sendHuman(text, type) {
+                if (!requireConnection()) return false;
+                currentAvatarBubble = null;
+                postJson('/human', Object.assign({
+                    text: text, type: type, interrupt: true, sessionid: currentSessionId()
+                }, currentTtsPayload())).catch(function() {});
+                return true;
+            }
+
+            function submitOnEnter(textareaSelector, formSelector) {
+                $(textareaSelector).on('keydown', function(e) {
+                    // 输入法选字时的回车（isComposing / keyCode 229）不是发送
+                    const native = e.originalEvent || e;   // jQuery 的事件对象不带 isComposing
+                    if (e.key !== 'Enter' || e.shiftKey || native.isComposing || e.keyCode === 229) return;
+                    e.preventDefault();
+                    $(formSelector).trigger('submit');
+                });
             }
 
             // ===== TTS 后端选择（从 /api/admin/config 动态加载，不硬编码） =====
@@ -700,160 +794,112 @@
 
             // 识别到的文本统一走这里发送，供本地 ASR / 浏览器 ASR 共用
             function sendRecognizedText(text) {
-                if (!text) return;
-                fetch('/human', {
-                    body: JSON.stringify(Object.assign({
-                        text: text, type: 'chat', interrupt: true,
-                        sessionid: String(document.getElementById('sessionid').value),
-                    }, currentTtsPayload())),
-                    headers: { 'Content-Type': 'application/json' },
-                    method: 'POST'
-                });
-                addChatMessage(text, 'user');
+                if (!text) {
+                    addNotice('没有识别到内容。请靠近麦克风，按住按钮说完整句话后再松开。');
+                    return;
+                }
+                if (sendHuman(text, 'chat')) addChatMessage(text, 'user');
+            }
+
+            function clearConnectTimer() {
+                if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            }
+
+            function showDisconnectedControls() {
+                $('#stop').hide();
+                $('#start').show();
+                $('#btn_start_record').prop('disabled', false);
+                $('#btn_stop_record').prop('disabled', true);
+                $('#recording-indicator').removeClass('active');
             }
 
             // 开始/停止按钮
             $('#start').click(function() {
                 updateConnectionStatus('connecting');
+                currentAvatarBubble = null;
                 start();
                 $(this).hide();
                 $('#stop').show();
-                
-                // 添加定时器检查视频流是否已加载
-                let connectionCheckTimer = setInterval(function() {
-                    const video = document.getElementById('video');
-                    // 检查视频是否有数据
-                    if (video.readyState >= 3 && video.videoWidth > 0) {
-                        updateConnectionStatus('connected');
-                        clearInterval(connectionCheckTimer);
+                clearConnectTimer();
+                connectTimer = setTimeout(function() {
+                    if (!isConnected) {
+                        addNotice('连接时间较长。如果一直没有画面，请点"停止连接"后重试；使用 VPN 请保持全局模式。');
                     }
-                }, 2000); // 每2秒检查一次
-                
-                // 60秒后如果还是连接中状态，就停止检查
-                setTimeout(function() {
-                    if (connectionCheckTimer) {
-                        clearInterval(connectionCheckTimer);
-                    }
-                }, 60000);
+                }, 30000);
             });
 
             $('#stop').click(function() {
                 stop();
-                $(this).hide();
-                $('#start').show();
+                isConnected = false;
+                clearConnectTimer();
+                closeEventStream();
+                document.getElementById('sessionid').value = '0';
                 updateConnectionStatus('disconnected');
+                showDisconnectedControls();
             });
 
             // 录制功能
             $('#btn_start_record').click(function() {
-                console.log('Starting recording...');
-                fetch('/record', {
-                    body: JSON.stringify({
-                        type: 'start_record',
-                        sessionid: String(document.getElementById('sessionid').value),
-                    }),
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    method: 'POST'
-                }).then(function(response) {
-                    if (response.ok) {
-                        console.log('Recording started.');
-                        $('#btn_start_record').prop('disabled', true);
-                        $('#btn_stop_record').prop('disabled', false);
-                        $('#recording-indicator').addClass('active');
-                    } else {
-                        console.error('Failed to start recording.');
-                    }
-                }).catch(function(error) {
-                    console.error('Error:', error);
-                });
+                if (!requireConnection()) return;
+                postJson('/record', { type: 'start_record', sessionid: currentSessionId() }).then(function() {
+                    $('#btn_start_record').prop('disabled', true);
+                    $('#btn_stop_record').prop('disabled', false);
+                    $('#recording-indicator').addClass('active');
+                }).catch(function() {});
             });
 
             $('#btn_stop_record').click(function() {
-                console.log('Stopping recording...');
-                fetch('/record', {
-                    body: JSON.stringify({
-                        type: 'end_record',
-                        sessionid: String(document.getElementById('sessionid').value),
-                    }),
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    method: 'POST'
-                }).then(function(response) {
-                    if (response.ok) {
-                        console.log('Recording stopped.');
-                        $('#btn_start_record').prop('disabled', false);
-                        $('#btn_stop_record').prop('disabled', true);
-                        $('#recording-indicator').removeClass('active');
-                    } else {
-                        console.error('Failed to stop recording.');
-                    }
-                }).catch(function(error) {
-                    console.error('Error:', error);
-                });
+                if (!requireConnection()) return;
+                postJson('/record', { type: 'end_record', sessionid: currentSessionId() }).then(function() {
+                    $('#btn_start_record').prop('disabled', false);
+                    $('#btn_stop_record').prop('disabled', true);
+                    $('#recording-indicator').removeClass('active');
+                }).catch(function() {});
+            });
+
+            $('#btn-interrupt').click(function() {
+                if (!requireConnection()) return;
+                postJson('/interrupt_talk', { sessionid: currentSessionId() }).catch(function() {});
             });
 
             $('#echo-form').on('submit', function(e) {
                 e.preventDefault();
-                var message = $('#message').val();
+                const message = $('#message').val();
                 if (!message.trim()) return;
-                
-                console.log('Sending echo message:', message);
-                
-                fetch('/human', {
-                    body: JSON.stringify(Object.assign({
-                        text: message,
-                        type: 'echo',
-                        interrupt: true,
-                        sessionid: String(document.getElementById('sessionid').value),
-                    }, currentTtsPayload())),
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    method: 'POST'
-                });
-
-                $('#message').val('');
-                addChatMessage(`已发送朗读请求: "${message}"`, 'system');
+                if (sendHuman(message, 'echo')) {
+                    $('#message').val('');
+                    addNotice('已发送朗读请求: ' + message);
+                }
             });
 
             // 聊天模式表单提交
             $('#chat-form').on('submit', function(e) {
                 e.preventDefault();
-                var message = $('#chat-message').val();
+                const message = $('#chat-message').val();
                 if (!message.trim()) return;
-
-                console.log('Sending chat message:', message);
-
-                fetch('/human', {
-                    body: JSON.stringify(Object.assign({
-                        text: message,
-                        type: 'chat',
-                        interrupt: true,
-                        sessionid: String(document.getElementById('sessionid').value),
-                    }, currentTtsPayload())),
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    method: 'POST'
-                });
-                
-                addChatMessage(message, 'user');
-                $('#chat-message').val('');
+                if (sendHuman(message, 'chat')) {
+                    addChatMessage(message, 'user');
+                    $('#chat-message').val('');
+                }
             });
 
+            submitOnEnter('#chat-message', '#chat-form');
+            submitOnEnter('#message', '#echo-form');
 
             // ===== 本地 SenseVoice ASR (WebSocket) =====
             let asrWs = null;
             let audioCtx = null;
             let asrProcessor = null;
             let micStream = null;
-            let isRecording = false;
+            let isRecording = false;       // 正在采集麦克风
+            let pressing = false;          // 按钮此刻是按下的（麦克风就绪前就松手要能放弃）
+            let asrStopRequested = false;  // 松手时 WebSocket 还没连上：连上后再发结束
+            let asrResultTimer = null;
             let pcmBuffer = new Int16Array(0);
+            let recordedSamples = 0;
             const ASR_SR = 16000;
             const ASR_CHUNK = 960;
+            const ASR_MIN_SAMPLES = ASR_SR * 0.4;   // 短于 0.4 秒的录音基本识别不出东西
 
             function resampleTo16k(float32, srcRate) {
                 if (srcRate === ASR_SR) return float32;
@@ -883,36 +929,75 @@
                 return $('input[name="asr-mode"]:checked').val() || 'local';
             }
 
-            // 按住说话按钮事件：根据 ASR 方式单选分派到本地 SenseVoice 或浏览器语音识别
-            $('#voice-record-btn').on('mousedown touchstart', function(e) {
-                e.preventDefault();
-                if (currentAsrMode() === 'browser') {
-                    startBrowserASR();
-                } else {
-                    startLocalASR();
+            function setVoiceLabel(text) {
+                $('.voice-record-label').text(text);
+            }
+
+            function resetVoiceButton() {
+                $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
+                setVoiceLabel('按住说话，松开发送');
+            }
+
+            function releaseMic() {
+                if (asrProcessor) { asrProcessor.disconnect(); asrProcessor = null; }
+                if (audioCtx) { audioCtx.close().catch(function() {}); audioCtx = null; }
+                if (micStream) { micStream.getTracks().forEach(function(t) { t.stop(); }); micStream = null; }
+            }
+
+            // 结束一次识别。先把 asrWs 置空再 close：close() 触发的 error/close 事件
+            // 就不会被当成"连接失败"，也不会误关下一次按键新建的连接。
+            function endAsr(ws) {
+                if (ws && asrWs !== ws) {
+                    try { ws.close(); } catch (e) {}
+                    return;
                 }
-            }).on('mouseup mouseleave touchend', function() {
-                if (currentAsrMode() === 'browser') {
-                    stopBrowserASR();
-                } else if (isRecording) {
-                    stopLocalASR();
+                if (asrResultTimer) { clearTimeout(asrResultTimer); asrResultTimer = null; }
+                isRecording = false;
+                asrStopRequested = false;
+                releaseMic();
+                resetVoiceButton();
+                const old = asrWs;
+                asrWs = null;
+                if (old) { try { old.close(); } catch (e) {} }
+            }
+
+            function finishUtterance(ws) {
+                if (pcmBuffer.length > 0) {
+                    ws.send(pcmBuffer.buffer);
+                    pcmBuffer = new Int16Array(0);
                 }
-            });
+                ws.send(JSON.stringify({
+                    chunk_size: [5, 10, 5], wav_name: 'h5',
+                    is_speaking: false, chunk_interval: 10, mode: '2pass'
+                }));
+            }
 
             async function startLocalASR() {
-                if (isRecording) return;
+                if (isRecording || asrWs) return;
+                if (!requireConnection()) { pressing = false; return; }
+
+                setVoiceLabel('准备麦克风…');
+                let stream;
                 try {
-                    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 } catch (err) {
                     console.error('无法访问麦克风:', err);
+                    resetVoiceButton();
                     alert('无法访问麦克风，请检查浏览器权限设置。');
                     return;
                 }
+                if (!pressing) {   // 麦克风就绪前已经松手：放弃这次录音
+                    stream.getTracks().forEach(function(t) { t.stop(); });
+                    resetVoiceButton();
+                    return;
+                }
 
+                micStream = stream;
                 isRecording = true;
                 pcmBuffer = new Int16Array(0);
+                recordedSamples = 0;
                 $('#voice-record-btn').addClass('recording-pulse').css('background-color', '#dc3545');
-                $('.voice-record-label').text('松开发送');
+                setVoiceLabel('松开发送');
 
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioCtx.createMediaStreamSource(micStream);
@@ -925,6 +1010,7 @@
                     const raw = e.inputBuffer.getChannelData(0);
                     const down = resampleTo16k(raw, audioCtx.sampleRate);
                     const pcm = floatToPcm16(down);
+                    recordedSamples += pcm.length;
                     const merged = new Int16Array(pcmBuffer.length + pcm.length);
                     merged.set(pcmBuffer);
                     merged.set(pcm, pcmBuffer.length);
@@ -941,60 +1027,82 @@
                 silencer.connect(audioCtx.destination);
 
                 const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-                asrWs = new WebSocket(proto + location.host + '/api/asr');
-                asrWs.onopen = function() {
-                    asrWs.send(JSON.stringify({
+                const ws = new WebSocket(proto + location.host + '/api/asr');
+                asrWs = ws;
+                ws.onopen = function() {
+                    ws.send(JSON.stringify({
                         chunk_size: [5, 10, 5], wav_name: 'h5',
                         is_speaking: true, chunk_interval: 10,
                         itn: false, mode: '2pass'
                     }));
+                    if (asrStopRequested) finishUtterance(ws);
                 };
-                asrWs.onmessage = function(e) {
+                ws.onmessage = function(e) {
+                    let text = '';
                     try {
-                        const data = JSON.parse(e.data);
-                        const text = (data.text || '').replace(/ +/g, '').trim();
-                        sendRecognizedText(text);
+                        text = (JSON.parse(e.data).text || '').replace(/ +/g, '').trim();
                     } catch (err) { console.error('ASR parse error:', err); }
-                    cleanupASR();
+                    endAsr(ws);
+                    sendRecognizedText(text);
                 };
-                asrWs.onerror = function() {
-                    addChatMessage('语音识别连接失败', 'system');
-                    cleanupASR();
+                ws.onerror = function() {
+                    if (asrWs !== ws) return;
+                    endAsr(ws);
+                    addNotice('语音识别服务连接失败，请再试一次；如果持续失败请反馈。');
+                };
+                ws.onclose = function() {
+                    if (asrWs !== ws) return;
+                    endAsr(ws);
+                    addNotice('语音识别连接被中断，请再试一次。');
                 };
             }
 
             function stopLocalASR() {
                 if (!isRecording) return;
                 isRecording = false;
+                releaseMic();
                 $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
-                $('.voice-record-label').text('识别中...');
-                if (asrProcessor) { asrProcessor.disconnect(); asrProcessor = null; }
-                if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
-                if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
-                if (asrWs && asrWs.readyState === 1) {
-                    if (pcmBuffer.length > 0) {
-                        asrWs.send(pcmBuffer.buffer);
-                        pcmBuffer = new Int16Array(0);
-                    }
-                    asrWs.send(JSON.stringify({
-                        chunk_size: [5, 10, 5], wav_name: 'h5',
-                        is_speaking: false, chunk_interval: 10, mode: '2pass'
-                    }));
-                } else {
-                    cleanupASR();
+                if (recordedSamples < ASR_MIN_SAMPLES) {
+                    endAsr(asrWs);
+                    addNotice('录音太短。请按住按钮说完整句话后再松开。');
+                    return;
                 }
-                setTimeout(function() { if (asrWs) { asrWs.close(); asrWs = null; } }, 10000);
+                const ws = asrWs;
+                if (!ws) { endAsr(null); return; }
+                setVoiceLabel('识别中...');
+                asrResultTimer = setTimeout(function() {
+                    if (asrWs !== ws) return;
+                    endAsr(ws);
+                    addNotice('语音识别超时，请再试一次。');
+                }, 15000);
+                if (ws.readyState === WebSocket.OPEN) {
+                    finishUtterance(ws);
+                } else if (ws.readyState === WebSocket.CONNECTING) {
+                    asrStopRequested = true;   // 连上之后 onopen 里再发结束
+                } else {
+                    endAsr(ws);
+                    addNotice('语音识别连接已断开，请再试一次。');
+                }
             }
 
-            function cleanupASR() {
-                isRecording = false;
-                $('#voice-record-btn').removeClass('recording-pulse').css('background-color', '');
-                $('.voice-record-label').text('按住说话，松开发送');
-                if (asrProcessor) { asrProcessor.disconnect(); asrProcessor = null; }
-                if (audioCtx) { audioCtx.close().catch(function(){}); audioCtx = null; }
-                if (micStream) { micStream.getTracks().forEach(function(t){ t.stop(); }); micStream = null; }
-                if (asrWs) { asrWs.close(); asrWs = null; }
-            }
+            // 按住说话按钮事件：根据 ASR 方式单选分派到本地 SenseVoice 或浏览器语音识别
+            $('#voice-record-btn').on('mousedown touchstart', function(e) {
+                e.preventDefault();
+                pressing = true;
+                if (currentAsrMode() === 'browser') {
+                    if (requireConnection()) startBrowserASR(); else pressing = false;
+                } else {
+                    startLocalASR();
+                }
+            }).on('mouseup mouseleave touchend touchcancel', function() {
+                if (!pressing) return;
+                pressing = false;
+                if (currentAsrMode() === 'browser') {
+                    stopBrowserASR();
+                } else if (isRecording) {
+                    stopLocalASR();
+                }
+            });
 
             // ===== 浏览器内置语音识别 (webkitSpeechRecognition) =====
             let browserRecognition = null;
@@ -1039,31 +1147,48 @@
                 }
             }
 
-            // WebRTC 相关功能
-            if (typeof window.onWebRTCConnected === 'function') {
-                const originalOnConnected = window.onWebRTCConnected;
-                window.onWebRTCConnected = function() {
-                    updateConnectionStatus('connected');
-                    if (originalOnConnected) originalOnConnected();
-                };
-            } else {
-                window.onWebRTCConnected = function() {
-                    updateConnectionStatus('connected');
-                };
-            }
+            // WebRTC 连接状态回调（由 client.js 在 connectionstatechange 时调用）
+            window.onWebRTCConnected = function() {
+                isConnected = true;
+                clearConnectTimer();
+                updateConnectionStatus('connected');
+            };
 
-            // 当连接断开时更新状态
-            if (typeof window.onWebRTCDisconnected === 'function') {
-                const originalOnDisconnected = window.onWebRTCDisconnected;
-                window.onWebRTCDisconnected = function() {
-                    updateConnectionStatus('disconnected');
-                    if (originalOnDisconnected) originalOnDisconnected();
-                };
-            } else {
-                window.onWebRTCDisconnected = function() {
-                    updateConnectionStatus('disconnected');
-                };
-            }
+            window.onWebRTCSession = function(sessionid) {
+                openEventStream(sessionid);
+            };
+
+            // 'disconnected' 在 WebRTC 里常常是暂时的，浏览器会自己恢复或转成 failed
+            window.onWebRTCUnstable = function() {
+                if (isConnected) updateConnectionStatus('connecting');
+            };
+
+            window.onWebRTCDisconnected = function(state) {
+                const wasConnected = isConnected;
+                isConnected = false;
+                clearConnectTimer();
+                closeEventStream();
+                document.getElementById('sessionid').value = '0';
+                updateConnectionStatus('disconnected');
+                showDisconnectedControls();
+                if (state === 'failed') {
+                    addNotice('视频连接没有建立成功：当前网络没能和服务器打通视频通道。请确认下方已勾选"使用 STUN/TURN 中继服务器"；使用 VPN 请保持全局模式；然后点"开始连接"重试。');
+                } else if (wasConnected) {
+                    addNotice('连接已断开，请点击"开始连接"重新连接。');
+                }
+            };
+
+            // 建立会话时服务器拒绝或出错（例如在线人数已满）
+            window.onWebRTCError = function(err) {
+                isConnected = false;
+                clearConnectTimer();
+                closeEventStream();
+                try { stop(); } catch (e) {}
+                document.getElementById('sessionid').value = '0';
+                updateConnectionStatus('disconnected');
+                showDisconnectedControls();
+                addNotice('连接失败: ' + (err && err.message ? err.message : err));
+            };
 
             // SRS WebRTC播放功能
             var sdk = null; // 全局处理器，用于在重新发布时进行清理

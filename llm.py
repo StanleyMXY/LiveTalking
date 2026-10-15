@@ -1,3 +1,5 @@
+import json
+import threading
 import time
 import os
 from typing import TYPE_CHECKING
@@ -26,20 +28,50 @@ def _llm_provider(opt) -> str:
     return getattr(opt, 'llm_provider', 'dashscope') or 'dashscope'
 
 
+_clients = {}
+_clients_lock = threading.Lock()
+
+
 def _llm_client(opt):
-    """Create the OpenAI-compatible client for the configured provider."""
-    from openai import OpenAI
-    cfg = LLM_PROVIDERS.get(_llm_provider(opt), LLM_PROVIDERS['dashscope'])
-    return OpenAI(
-        api_key=os.getenv(cfg['api_key_env']),
-        base_url=cfg['base_url'],
-    )
+    """OpenAI-compatible client for the configured provider, created once per provider.
+
+    Building one per message re-imports/initialises httpx and the TLS context on
+    the request path; a fresh process measured 26-28 s for it on the first
+    messages of a session.
+    """
+    provider = _llm_provider(opt)
+    cfg = LLM_PROVIDERS.get(provider, LLM_PROVIDERS['dashscope'])
+    with _clients_lock:
+        client = _clients.get(provider)
+        if client is None:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=os.getenv(cfg['api_key_env']),
+                base_url=cfg['base_url'],
+            )
+            _clients[provider] = client
+        return client
+
+
+def warmup(opt):
+    """Build the client at startup so the first user message does not pay for it."""
+    try:
+        t0 = time.perf_counter()
+        _llm_client(opt)
+        logger.info("LLM client ready (%.1fs)", time.perf_counter() - t0)
+    except Exception:
+        logger.exception("LLM client warmup failed")
 
 
 def _llm_model(opt) -> str:
     """Resolve the model name, falling back to the provider default."""
     cfg = LLM_PROVIDERS.get(_llm_provider(opt), LLM_PROVIDERS['dashscope'])
     return getattr(opt, 'llm_model', '') or cfg['default_model']
+
+
+def _emit(avatar_session, status: str, text: str):
+    """把回复文字/错误推给页面（/sse）。TTS 出问题时页面也要能看到回答。"""
+    avatar_session.send_msg(json.dumps({'status': status, 'text': text}, ensure_ascii=False))
 
 
 def llm_response(message,avatar_session:'BaseAvatar',datainfo:dict={}):
@@ -78,14 +110,20 @@ def llm_response(message,avatar_session:'BaseAvatar',datainfo:dict={}):
                         lastpos = i+1
                         if len(result)>10:
                             logger.info(result)
+                            _emit(avatar_session, 'reply', result)
                             avatar_session.put_msg_txt(result,datainfo)
                             result=""
                 result = result+msg[lastpos:]
         end = time.perf_counter()
         logger.info(f"llm Time to last chunk: {end-start}s")
         if result:
+            _emit(avatar_session, 'reply', result)
             avatar_session.put_msg_txt(result,datainfo)
 
     except Exception as e:
         logger.exception('llm exceptiopn:')
+        try:
+            _emit(avatar_session, 'llm_error', f'大模型调用失败: {type(e).__name__}')
+        except Exception:
+            logger.exception('llm error report failed:')
         return

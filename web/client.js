@@ -23,12 +23,24 @@ function negotiate() {
             method: 'POST'
         });
     }).then((response) => {
+        if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+        }
         return response.json();
     }).then((answer) => {
-        document.getElementById('sessionid').value = answer.sessionid
+        // the server answers {code: -1, msg} instead of an SDP when it refuses (e.g. session limit)
+        if (answer.code === -1 || !answer.sessionid) {
+            throw new Error(answer.msg || 'server refused the session');
+        }
+        document.getElementById('sessionid').value = answer.sessionid;
+        if (window.onWebRTCSession) window.onWebRTCSession(answer.sessionid);
         return pc.setRemoteDescription(answer);
     }).catch((e) => {
-        alert(e);
+        if (window.onWebRTCError) {
+            window.onWebRTCError(e);
+        } else {
+            alert(e);
+        }
     });
 }
 
@@ -42,6 +54,18 @@ async function start() {
     }
 
     pc = new RTCPeerConnection(config);
+
+    // report the real connection state to the page
+    pc.addEventListener('connectionstatechange', () => {
+        const state = pc.connectionState;
+        if (state === 'connected' && window.onWebRTCConnected) {
+            window.onWebRTCConnected();
+        } else if (state === 'disconnected' && window.onWebRTCUnstable) {
+            window.onWebRTCUnstable();
+        } else if ((state === 'failed' || state === 'closed') && window.onWebRTCDisconnected) {
+            window.onWebRTCDisconnected(state);
+        }
+    });
 
     // connect audio / video
     pc.addEventListener('track', (evt) => {
@@ -66,22 +90,18 @@ function stop() {
     }, 500);
 }
 
-window.onunload = function(event) {
-    // 在这里执行你想要的操作
-    setTimeout(() => {
-        if (pc) pc.close();
-    }, 500);
-};
+window.addEventListener('pagehide', function() {
+    if (pc) pc.close();
+});
 
+// Ask before leaving only while a session is live or being set up. Asking
+// unconditionally made every refresh (including the one used to recover from a
+// failed connection) show a confirmation dialog.
 window.onbeforeunload = function (e) {
-        setTimeout(() => {
-                if (pc) pc.close();
-            }, 500);
-        e = e || window.event
-        // 兼容IE8和Firefox 4之前的版本
-        if (e) {
-          e.returnValue = '关闭提示'
-        }
-        // Chrome, Safari, Firefox 4+, Opera 12+ , IE 9+
-        return '关闭提示'
-      }
+    if (!pc || (pc.connectionState !== 'connected' && pc.connectionState !== 'connecting')) {
+        return undefined;
+    }
+    e.preventDefault();
+    e.returnValue = '';
+    return '';
+};

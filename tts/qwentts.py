@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 import time
 import threading
@@ -24,9 +25,15 @@ except ImportError:
 SRC_SR = 24000   # Qwen TTS 只支持 24kHz 输出
 DST_SR = 16000   # 项目标准采样率
 
+# 预置音色名单来自阿里云百炼官方音色表（qwen-tts-voice-list）。2026-10-15 逐个用
+# qwen3-tts-flash-realtime 合成过一个词，下面 48 个全部通过；原先写在这里的
+# Daniel / Aidan / Vivienne / Aria / Alya / Ravi 被服务端拒绝（Invalid voice specified）。
 PRESET_VOICES = {
-    'Cherry', 'Ethan', 'Serena', 'Daniel', 'Chelsie',
-    'Aidan', 'Vivienne', 'Aria', 'Alya', 'Ravi',
+    'Cherry', 'Serena', 'Ethan', 'Chelsie', 'Momo', 'Vivian', 'Moon', 'Maia', 'Kai', 'Nofish',
+    'Bella', 'Jennifer', 'Ryan', 'Katerina', 'Aiden', 'Eldric Sage', 'Mia', 'Mochi', 'Bellona',
+    'Vincent', 'Bunny', 'Neil', 'Elias', 'Arthur', 'Nini', 'Seren', 'Pip', 'Stella', 'Bodega',
+    'Sonrisa', 'Alek', 'Dolce', 'Sohee', 'Ono Anna', 'Lenn', 'Emilien', 'Andre', 'Radio Gol',
+    'Jada', 'Dylan', 'Li', 'Marcus', 'Roy', 'Peter', 'Sunny', 'Eric', 'Rocky', 'Kiki',
 }
 
 
@@ -98,11 +105,16 @@ class QwenTTS(BaseTTS):
 
                     elif event_type == 'response.done':
                         logger.info("QwenTTS response done")
+                        tts_ref._last_good_voice = tts_ref.voice
                         tts_ref._flush_remainder()
                         tts_ref._response_event.set()
 
                     elif event_type == 'error':
                         logger.error(f"QwenTTS 错误: {response}")
+                        # 服务端拒绝某个音色后会关闭连接；退回上一个可用音色，下一句话重连时使用
+                        tts_ref.voice = tts_ref._last_good_voice
+                        message = (response.get('error') or {}).get('message', '')
+                        tts_ref._report_error(f"语音合成失败: {message}")
                         tts_ref._response_event.set()
 
                 except Exception as e:
@@ -115,6 +127,15 @@ class QwenTTS(BaseTTS):
             callback=self._callback,
             url=self.ws_url,
         )
+        # 预置音色模型只接受 PRESET_VOICES 里的名字；克隆音色模型不做这个限制
+        self._preset_only = self.model == 'qwen3-tts-flash-realtime'
+        self._last_good_voice = self.voice
+        self._open_connection()
+        logger.info(f"QwenTTS 初始化完成: model={self.model}, voice={self.voice}")
+
+    # ========================== 连接管理 ==========================
+
+    def _open_connection(self):
         self._tts_client.connect()
         self._tts_client.update_session(
             voice=self.voice,
@@ -122,7 +143,24 @@ class QwenTTS(BaseTTS):
             sample_rate=16000,
             mode='commit',
         )
-        logger.info(f"QwenTTS 初始化完成: model={self.model}, voice={self.voice}")
+
+    def _reopen_connection(self):
+        try:
+            self._tts_client.close()
+        except Exception:
+            pass  # 服务端已经关闭时 close() 可能抛错，重连照常进行
+        self._open_connection()
+
+    def _send_text(self, text: str):
+        self._tts_client.append_text(text)
+        self._tts_client.commit()
+
+    def _report_error(self, text: str):
+        """把合成失败推给页面（走 /sse），否则测试的人只会看到没有声音"""
+        try:
+            self.parent.send_msg(json.dumps({'status': 'tts_error', 'text': text}, ensure_ascii=False))
+        except Exception:
+            logger.exception("QwenTTS 上报错误失败")
 
     # ========================== 核心方法 ==========================
 
@@ -130,7 +168,7 @@ class QwenTTS(BaseTTS):
         text, textevent = msg
         t_start = time.perf_counter()
 
-        ref_file = textevent.get('tts', {}).get('ref_file',self.voice)
+        ref_file = textevent.get('tts', {}).get('ref_file') or self.voice
 
         # 重置状态
         self._remainder = np.array([], dtype=np.float32)
@@ -142,18 +180,20 @@ class QwenTTS(BaseTTS):
         try:
             #logger.info(f"QwenTTS 发送文本: {text[:80]}...")
             if ref_file != self.voice:
-                logger.info(f'ref_file:{ref_file},self.voice:{self.voice}')
-                self.voice=ref_file
-                self._tts_client.close()
-                self._tts_client.connect()
-                self._tts_client.update_session(
-                    voice=self.voice,
-                    response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,  # Qwen TTS 只支持 24kHz 输出
-                    sample_rate=16000,
-                    mode='commit',
-                )
-            self._tts_client.append_text(text)
-            self._tts_client.commit()
+                if self._preset_only and ref_file not in PRESET_VOICES:
+                    # 不能把会话切到一个服务端不认的音色：它会关闭连接，之后每句话都失败
+                    logger.warning(f"QwenTTS: 音色 {ref_file!r} 不在可用列表中，继续使用 {self.voice!r}")
+                else:
+                    logger.info(f'ref_file:{ref_file},self.voice:{self.voice}')
+                    self.voice = ref_file
+                    self._reopen_connection()
+            try:
+                self._send_text(text)
+            except ConnectionError:
+                # 连接空闲超时或被服务端关闭：重连后补发这一句，而不是让之后每句话都失败
+                logger.warning("QwenTTS: 连接已断开，正在重连")
+                self._reopen_connection()
+                self._send_text(text)
 
             # 等待 response.done（音频在回调中流式处理）
             self._response_event.wait(timeout=60)
@@ -163,6 +203,7 @@ class QwenTTS(BaseTTS):
 
         except Exception as e:
             logger.exception(f"QwenTTS txt_to_audio 异常: {e}")
+            self._report_error(f"语音合成失败: {e}")
 
     # ========================== 流式音频处理（回调中调用）==========================
 

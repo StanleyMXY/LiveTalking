@@ -5,6 +5,7 @@
 import json
 import re
 import asyncio
+import threading
 import requests
 from aiohttp import web
 
@@ -179,15 +180,22 @@ async def sse_handler(request):
     await response.prepare(request)
 
     import queue
+    import time
     msgqueue = queue.Queue()
     avatar_session.add_msgqueue(msgqueue)
 
+    last_write = time.monotonic()
     try:
         while True:
             try:
                 msg = msgqueue.get_nowait()
                 await response.write(f"data: {msg}\n\n".encode('utf-8'))
+                last_write = time.monotonic()
             except queue.Empty:
+                # 注释行当心跳：隧道/代理会关掉长时间没有数据的连接
+                if time.monotonic() - last_write > 15:
+                    await response.write(b": ping" + bytes([10, 10]))
+                    last_write = time.monotonic()
                 await asyncio.sleep(0.01)
     except (asyncio.CancelledError, ConnectionResetError):
         logger.info('SSE connection closed for session: %s', sessionid)
@@ -398,10 +406,12 @@ def setup_routes(app):
 
     # ── Local ASR endpoint (SenseVoice/FunASR) ── Issue #604 ──
     try:
-        from server.asr_server import asr_websocket_handler, is_funasr_available
+        from server.asr_server import asr_websocket_handler, is_funasr_available, _load_sensevoice
         if is_funasr_available():
             app.router.add_get("/api/asr", asr_websocket_handler)
             logger.info("[ASR] Local SenseVoice ASR endpoint enabled at /api/asr")
+            # 启动时就加载模型：否则第一个按住说话的人要白等约 9 秒，页面上什么都没有
+            threading.Thread(target=_load_sensevoice, name="sensevoice-preload", daemon=True).start()
         else:
             logger.info("[ASR] funasr not installed — local ASR endpoint disabled "
                         "(pip install funasr modelscope)")

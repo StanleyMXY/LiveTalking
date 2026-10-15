@@ -6,20 +6,8 @@ function negotiate() {
     return pc.createOffer().then((offer) => {
         return pc.setLocalDescription(offer);
     }).then(() => {
-        // wait for ICE gathering to complete
-        return new Promise((resolve) => {
-            if (pc.iceGatheringState === 'complete') {
-                resolve();
-            } else {
-                const checkState = () => {
-                    if (pc.iceGatheringState === 'complete') {
-                        pc.removeEventListener('icegatheringstatechange', checkState);
-                        resolve();
-                    }
-                };
-                pc.addEventListener('icegatheringstatechange', checkState);
-            }
-        });
+        // wait for ICE gathering to complete (bounded: see waitForIceGathering)
+        return waitForIceGathering(pc, 4000);
     }).then(() => {
         var offer = pc.localDescription;
         var body = { sdp: offer.sdp, type: offer.type };
@@ -44,13 +32,13 @@ function negotiate() {
     });
 }
 
-function start() {
+async function start() {
     var config = {
         sdpSemantics: 'unified-plan'
     };
 
     if (document.getElementById('use-stun').checked) {
-        config.iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+        config.iceServers = await fetchIceServers();
     }
 
     pc = new RTCPeerConnection(config);
@@ -74,20 +62,20 @@ function stop() {
 
     // close peer connection
     setTimeout(() => {
-        pc.close();
+        if (pc) pc.close();
     }, 500);
 }
 
 window.onunload = function(event) {
     // 在这里执行你想要的操作
     setTimeout(() => {
-        pc.close();
+        if (pc) pc.close();
     }, 500);
 };
 
 window.onbeforeunload = function (e) {
         setTimeout(() => {
-                pc.close();
+                if (pc) pc.close();
             }, 500);
         e = e || window.event
         // 兼容IE8和Firefox 4之前的版本

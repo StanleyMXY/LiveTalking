@@ -9,6 +9,7 @@ import requests
 from aiohttp import web
 
 from utils.logger import logger
+from server.ice import get_ice_servers
 
 _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # SenseVoice 的 rich_transcription_postprocess 会在文字前后附带情绪/事件表情符号，
@@ -197,12 +198,36 @@ async def sse_handler(request):
     return response
 
 
+_SENSITIVE_KEY_RE = re.compile(r'key|token|secret|credential|password', re.IGNORECASE)
+
+
+def _redact(value):
+    """递归遮蔽名字里带 key/token/secret/credential/password 的配置值（接口未鉴权）"""
+    if isinstance(value, dict):
+        return {
+            k: ("***" if _SENSITIVE_KEY_RE.search(str(k)) and v else _redact(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
+async def get_ice(request):
+    """GET /api/ice — 浏览器建立 RTCPeerConnection 用的 STUN/TURN 服务器列表"""
+    try:
+        return json_ok(data={"iceServers": await get_ice_servers()})
+    except Exception as e:
+        logger.exception('get_ice exception:')
+        return json_error(str(e))
+
+
 async def admin_config(request):
     """Admin: 获取全局配置参数"""
     try:
         opt = request.app.get("opt")
         if opt:
-            return json_ok(data={"config": vars(opt)})
+            return json_ok(data={"config": _redact(vars(opt))})
         return json_error("Config not found")
     except Exception as e:
         logger.exception('admin_config exception:')
@@ -364,6 +389,7 @@ def setup_routes(app):
     app.router.add_post("/record", record)
     app.router.add_post("/interrupt_talk", interrupt_talk)
     app.router.add_post("/is_speaking", is_speaking)
+    app.router.add_get("/api/ice", get_ice)
     app.router.add_get("/api/admin/config", admin_config)
     app.router.add_get("/api/admin/sessions", admin_sessions)
     app.router.add_get("/api/tts/voices", get_tts_voices)

@@ -1,0 +1,73 @@
+# Run from this directory on the Spark:  docker compose up -d --build
+# Layout next to the checkout (../../..): .env, models/, data/avatars/, hf-cache/, caddy-data/ (see README.md).
+name: avatar-demo
+services:
+  livetalking:
+    image: livetalking-spark:cu130
+    build:
+      context: ../..
+      dockerfile: deploy/spark/Dockerfile
+    container_name: livetalking
+    network_mode: host      # WebRTC needs the host's real addresses for ICE
+    ipc: host
+    restart: unless-stopped
+    env_file: ../../../.env
+    environment:
+      HF_HOME: /hf-cache
+      HF_HUB_OFFLINE: "1"   # the Spark cannot reach huggingface.co; models are copied into hf-cache
+      ICE_SERVERS_DISABLED: "1"   # viewers reach the Spark over the VPN: direct paths, no STUN/TURN needed
+      SADTALKER_DIR: /opt/sadtalker      # photo avatars: server/avatar_routes.py runs SadTalker's inference.py
+      SADTALKER_PYTHON: python3          # with this container's interpreter (dependencies are in the image)
+      TORCH_HOME: /opt/sadtalker/checkpoints   # face detection (S3FD) loads hub/checkpoints/s3fd-*.pth from here;
+                                               # its download URL (adrianbulat.com) is not reachable from the Spark
+    # umask 000: the container runs as root, and what it writes into the mounted data/ must stay
+    # deletable by the host user.
+    command: ["sh", "-c", "umask 000 && exec python3 app.py --transport webrtc --model wav2lip --avatar_id wav2lip256_avatar1 --stun ''"]
+    volumes:
+      - ../../../models:/app/models
+      - ../../../data/avatars:/app/data/avatars
+      - ../../../hf-cache:/hf-cache
+      - ../../../sadtalker-src:/opt/sadtalker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  cosyvoice:
+    image: cosyvoice-spark:cu130
+    build:
+      context: .
+      dockerfile: cosyvoice.Dockerfile
+    container_name: cosyvoice
+    network_mode: host      # LiveTalking reaches it at http://127.0.0.1:8091 (config.yaml: cosyvoice_local)
+    ipc: host
+    restart: unless-stopped
+    environment:
+      HF_HOME: /hf-cache
+      HF_HUB_OFFLINE: "1"
+      PYTHONPATH: /opt/cosyvoice:/opt/cosyvoice/third_party/Matcha-TTS
+    volumes:
+      - ../../../cosyvoice-src:/opt/cosyvoice
+      - ../../../cosyvoice-voices:/opt/cosyvoice/voices   # reference voices incl. the ones testers clone
+      - ../../../hf-cache:/hf-cache:ro
+    command: ["sh", "-c", "umask 000 && exec python3 cosyvoice_api_server.py --port 8091 --model_dir /hf-cache/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/29e01c4e8d000f4bcd70751be16fa94bf3d85a18"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  proxy:
+    image: docker.m.daocloud.io/library/caddy:2
+    container_name: livetalking-proxy
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [livetalking]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../../caddy-data:/data

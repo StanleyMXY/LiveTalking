@@ -1,0 +1,5 @@
+# Keep the PyTorch stack of the base image; nothing below may replace it.
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+torchaudio==2.10.0+cu130
+numpy==1.26.4

@@ -1,0 +1,9 @@
+.git
+.venv
+logs
+data
+models
+downloads
+**/__pycache__
+*.log
+deploy/spark/*.md

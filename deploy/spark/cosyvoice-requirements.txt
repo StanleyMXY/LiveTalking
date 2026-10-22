@@ -1,0 +1,29 @@
+# Top-level packages of the CosyVoice environment (torch comes from the base image).
+# transformers/diffusers are CosyVoice's documented versions: with transformers 5.x the synthesized
+# speech is unintelligible (measured on the Spark: ASR heard noise for every voice), with 4.51.3 it is not.
+conformer
+diffusers==0.29.0
+fastapi
+uvicorn
+gdown
+HyperPyYAML
+hydra-core
+inflect
+librosa
+lightning
+matplotlib
+modelscope
+omegaconf
+onnx
+onnxruntime
+openai-whisper
+protobuf
+pyarrow
+pydantic
+python-multipart
+soundfile
+transformers==4.51.3
+wetext
+wget
+x-transformers
+huggingface_hub<1.0

@@ -1,0 +1,11 @@
+# TLS in front of LiveTalking for viewers on the private (VPN) network. Browsers only allow the
+# microphone on https pages, and the Spark has no public domain, so Caddy signs the certificate
+# for the two addresses with its own CA (kept in caddy-data/, so it stays the same across restarts).
+{
+	auto_https disable_redirects
+}
+
+https://10.8.0.1:8443, https://192.168.1.108:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8010
+}

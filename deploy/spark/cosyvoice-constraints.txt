@@ -1,0 +1,5 @@
+# Keep the PyTorch stack of the base image; nothing below may replace it.
+# (No numpy pin: CosyVoice's pyarrow, opencv and cupy need numpy 2; the LiveTalking image pins numpy 1.26.)
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+torchaudio==2.10.0+cu130

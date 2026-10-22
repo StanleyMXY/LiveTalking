@@ -41,7 +41,8 @@ class RTCManager:
 
     async def _create_pc_and_answer(self, avatar_session, sessionid, offer):
         """创建 PeerConnection、添加轨道、SDP 交换，返回已完成 answer 的 pc"""
-        ice_servers = [RTCIceServer(urls=self.opt.stun)]
+        # An empty --stun means no external ICE server (every peer is reachable on a private network)
+        ice_servers = [RTCIceServer(urls=self.opt.stun)] if self.opt.stun else []
         turn_url = getattr(self.opt, 'turn_url', '')
         if turn_url:
             ice_servers.append(RTCIceServer(

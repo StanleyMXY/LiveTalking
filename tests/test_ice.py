@@ -44,6 +44,11 @@ class IceServersTest(unittest.TestCase):
         servers = ice.drop_port_53([{"urls": ["turn:h:3453?transport=udp", "turn:h:53"]}])
         self.assertEqual(servers[0]["urls"], ["turn:h:3453?transport=udp"])
 
+    def test_disabled_flag_returns_no_servers_and_never_calls_the_api(self):
+        with patch.dict(os.environ, {"ICE_SERVERS_DISABLED": "1"}),                 patch.object(ice, "_mint_blocking") as mint:
+            self.assertEqual(run(ice.get_ice_servers()), [])
+            mint.assert_not_called()
+
     def test_without_key_serves_stun_only_and_never_calls_the_api(self):
         with patch.dict(os.environ, {"CF_TURN_KEY_ID": "", "CF_TURN_API_TOKEN": ""}), \
                 patch.object(ice, "_mint_blocking") as mint:

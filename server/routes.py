@@ -206,6 +206,44 @@ async def sse_handler(request):
     return response
 
 
+async def events_ws(request):
+    """GET /ws/events?sessionid= — the events of /sse (reply text, errors) over a WebSocket.
+
+    Cloudflare quick tunnels do not carry Server-Sent Events, WebSockets pass through them.
+    """
+    import queue
+
+    sessionid = request.query.get('sessionid', '')
+    avatar_session = session_manager.get_session(sessionid)
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    if avatar_session is None:
+        await ws.close(code=4404, message=b'session not found')
+        return ws
+
+    msgqueue = queue.Queue()
+    avatar_session.add_msgqueue(msgqueue)
+
+    async def drain_client():
+        async for _ in ws:   # ends when the client closes; also lets aiohttp answer pings/close frames
+            pass
+
+    reader = asyncio.ensure_future(drain_client())
+    try:
+        while not reader.done():
+            try:
+                await ws.send_str(msgqueue.get_nowait())
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+    except (asyncio.CancelledError, ConnectionResetError):
+        logger.info('events websocket closed for session: %s', sessionid)
+    finally:
+        reader.cancel()
+        if msgqueue in avatar_session.msgqueues:
+            avatar_session.msgqueues.remove(msgqueue)
+    return ws
+
+
 _SENSITIVE_KEY_RE = re.compile(r'key|token|secret|credential|password', re.IGNORECASE)
 
 
@@ -403,6 +441,7 @@ def setup_routes(app):
     app.router.add_get("/api/tts/voices", get_tts_voices)
     app.router.add_post("/api/tts/voices", post_tts_voices)
     app.router.add_get('/sse', sse_handler)
+    app.router.add_get('/ws/events', events_ws)
 
     # ── Local ASR endpoint (SenseVoice/FunASR) ── Issue #604 ──
     try:

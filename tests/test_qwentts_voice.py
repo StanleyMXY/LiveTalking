@@ -1,6 +1,6 @@
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tts.qwentts import PRESET_VOICES, QwenTTS
 
@@ -86,6 +86,37 @@ class TxtToAudioTest(unittest.TestCase):
         tts = make_tts(voice="cloned-voice-id", preset_only=False)
         tts.txt_to_audio(("你好", {"tts": {"ref_file": "another-cloned-id"}}))
         self.assertEqual(tts.voice, "another-cloned-id")
+
+
+class OpenConnectionRetryTest(unittest.TestCase):
+    def make(self):
+        tts = object.__new__(QwenTTS)
+        tts.voice = "Cherry"
+        tts._tts_client = MagicMock()
+        return tts
+
+    def test_slow_handshake_is_retried_until_it_succeeds(self):
+        tts = self.make()
+        tts._tts_client.connect.side_effect = [TimeoutError("5s"), TimeoutError("5s"), None]
+        with patch("tts.qwentts.time.sleep"):
+            tts._open_connection()
+        self.assertEqual(tts._tts_client.connect.call_count, 3)
+        tts._tts_client.update_session.assert_called_once()
+
+    def test_gives_up_after_the_last_attempt_with_the_original_error(self):
+        tts = self.make()
+        tts._tts_client.connect.side_effect = TimeoutError("5s")
+        with patch("tts.qwentts.time.sleep"):
+            with self.assertRaises(TimeoutError):
+                tts._open_connection()
+        self.assertEqual(tts._tts_client.connect.call_count, 3)
+
+    def test_other_errors_are_not_retried(self):
+        tts = self.make()
+        tts._tts_client.connect.side_effect = ValueError("bad config")
+        with self.assertRaises(ValueError):
+            tts._open_connection()
+        self.assertEqual(tts._tts_client.connect.call_count, 1)
 
 
 if __name__ == "__main__":

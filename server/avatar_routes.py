@@ -11,7 +11,11 @@ _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
 SADTALKER_DIR = os.getenv('SADTALKER_DIR', 'D:/Projects/SadTalker')
-SADTALKER_PYTHON = os.path.join(SADTALKER_DIR, '.venv', 'Scripts', 'python.exe')
+# The interpreter that runs SadTalker's inference.py: SADTALKER_PYTHON wins (a container with the
+# dependencies installed system-wide sets it to python3); otherwise SadTalker's own virtualenv.
+_SADTALKER_VENV_PYTHON = (os.path.join('.venv', 'Scripts', 'python.exe') if os.name == 'nt'
+                          else os.path.join('.venv', 'bin', 'python'))
+SADTALKER_PYTHON = os.getenv('SADTALKER_PYTHON') or os.path.join(SADTALKER_DIR, _SADTALKER_VENV_PYTHON)
 SADTALKER_TORCH_HOME = os.path.join(SADTALKER_DIR, 'checkpoints', 'hub')
 IDLE_DRIVER_AUDIO = os.path.abspath('./assets/sadtalker_idle_silence.wav')
 

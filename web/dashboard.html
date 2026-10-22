@@ -567,11 +567,16 @@
                 $box.scrollTop($box[0].scrollHeight);
             }
 
-            let eventSource = null;
+            // 回复文字和错误提示走 WebSocket（/ws/events）。Cloudflare 临时隧道不支持 SSE。
+            let eventSocket = null;
+            let eventSocketSession = null;
             function openEventStream(sessionid) {
                 closeEventStream();
-                eventSource = new EventSource('/sse?sessionid=' + encodeURIComponent(sessionid));
-                eventSource.onmessage = function(e) {
+                eventSocketSession = sessionid;
+                const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+                const ws = new WebSocket(proto + location.host + '/ws/events?sessionid=' + encodeURIComponent(sessionid));
+                eventSocket = ws;
+                ws.onmessage = function(e) {
                     let msg;
                     try { msg = JSON.parse(e.data); } catch (err) { return; }
                     if (msg.status === 'reply') {
@@ -580,9 +585,20 @@
                         addNotice(msg.text);
                     }
                 };
+                ws.onclose = function() {
+                    // 连接还在而事件通道掉了（网络抖动）：2 秒后重连一次；会话已结束则不再重连
+                    if (eventSocket !== ws) return;
+                    eventSocket = null;
+                    if (isConnected && eventSocketSession === sessionid) {
+                        setTimeout(function() {
+                            if (isConnected && eventSocketSession === sessionid && !eventSocket) openEventStream(sessionid);
+                        }, 2000);
+                    }
+                };
             }
             function closeEventStream() {
-                if (eventSource) { eventSource.close(); eventSource = null; }
+                eventSocketSession = null;
+                if (eventSocket) { const ws = eventSocket; eventSocket = null; ws.close(); }
             }
 
             function currentSessionId() {
@@ -654,6 +670,15 @@
                 });
             }
 
+            // 克隆声音只有 omnitts（CosyVoice）后端支持；其他后端下把表单禁用并说明原因
+            let ttsBackendsById = {};
+            function updateCloneAvailability() {
+                const backend = ttsBackendsById[$('#tts-backend-select').val()];
+                const canClone = !!backend && backend.module === 'omnitts';
+                $('#voice-clone-form :input').prop('disabled', !canClone);
+                $('#voice-clone-status').text(canClone ? '' : '当前 TTS 后端不支持克隆声音。请先在上面的"TTS 后端"里选择 cosyvoice_local。');
+            }
+
             fetch('/api/admin/config').then(function(res) {
                 return res.json();
             }).then(function(res) {
@@ -665,9 +690,11 @@
                     return;
                 }
                 backends.forEach(function(b) {
+                    ttsBackendsById[b.id] = b;
                     $select.append(`<option value="${b.id}">${b.id} (${b.module})</option>`);
                 });
                 loadVoicesForBackend($select.val());
+                updateCloneAvailability();
             }).catch(function(err) {
                 console.error('加载 TTS 后端列表失败:', err);
                 $('#tts-backend-select').empty().append('<option value="">(加载失败，使用默认)</option>');
@@ -675,6 +702,7 @@
 
             $('#tts-backend-select').on('change', function() {
                 loadVoicesForBackend($(this).val());
+                updateCloneAvailability();
             });
 
             function currentTtsPayload() {

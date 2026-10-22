@@ -8,7 +8,8 @@ async function fetchIceServers() {
         const res = await fetch('/api/ice', { cache: 'no-store' });
         const body = await res.json();
         const servers = body && body.data && body.data.iceServers;
-        if (body.code === 0 && Array.isArray(servers) && servers.length) {
+        // an empty list is a valid answer: the server wants no external ICE servers
+        if (body.code === 0 && Array.isArray(servers)) {
             return servers;
         }
         console.warn('GET /api/ice returned no ICE servers, using STUN only:', body);

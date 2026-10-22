@@ -135,14 +135,28 @@ class QwenTTS(BaseTTS):
 
     # ========================== 连接管理 ==========================
 
-    def _open_connection(self):
-        self._tts_client.connect()
-        self._tts_client.update_session(
-            voice=self.voice,
-            response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,  # Qwen TTS 只支持 24kHz 输出
-            sample_rate=16000,
-            mode='commit',
-        )
+    def _open_connection(self, attempts: int = 3):
+        # SDK 的 connect() 只等 5 秒；跨境网络上 TCP+TLS+WebSocket 握手偶尔会超过它
+        # （同一台机器上实测握手 0.9-1.9 秒，偶发更慢），所以重试几次而不是让整个后端被跳过。
+        for attempt in range(1, attempts + 1):
+            try:
+                self._tts_client.connect()
+                self._tts_client.update_session(
+                    voice=self.voice,
+                    response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,  # Qwen TTS 只支持 24kHz 输出
+                    sample_rate=16000,
+                    mode='commit',
+                )
+                return
+            except (TimeoutError, ConnectionError) as e:
+                if attempt == attempts:
+                    raise
+                logger.warning(f"QwenTTS: 连接失败（第 {attempt}/{attempts} 次）: {e}，重试")
+                try:
+                    self._tts_client.close()
+                except Exception:
+                    pass
+                time.sleep(0.5 * attempt)
 
     def _reopen_connection(self):
         try:

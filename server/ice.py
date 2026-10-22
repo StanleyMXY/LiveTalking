@@ -57,6 +57,11 @@ def _mint_blocking(key_id: str, api_token: str):
 
 
 async def get_ice_servers():
+    # Set ICE_SERVERS_DISABLED=1 where every viewer reaches the server on a private network
+    # (for example over a VPN): external STUN/TURN servers would only delay candidate gathering.
+    if os.environ.get("ICE_SERVERS_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return []
+
     key_id = os.environ.get("CF_TURN_KEY_ID", "").strip()
     api_token = os.environ.get("CF_TURN_API_TOKEN", "").strip()
     if not key_id or not api_token:

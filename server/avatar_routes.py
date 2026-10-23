@@ -4,6 +4,7 @@ import re
 import uuid
 from aiohttp import web
 from server.task_manager import task_manager
+from server.media_utils import limit_image_side
 from utils.logger import logger
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -43,6 +44,10 @@ def animate_image_with_sadtalker(image_path: str, progress_callback=None) -> str
 
     if progress_callback:
         progress_callback(5)
+
+    # Cap the photo size first: SadTalker pastes every frame back onto the full photo, which grows
+    # much faster than the photo (see server/media_utils.py).
+    image_path = limit_image_side(image_path)
 
     result_dir = os.path.abspath(f'./data/tmp/sadtalker_{uuid_mod.uuid4()}')
     os.makedirs(result_dir, exist_ok=True)

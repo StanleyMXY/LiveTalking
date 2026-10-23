@@ -11,6 +11,7 @@ from aiohttp import web
 
 from utils.logger import logger
 from server.ice import get_ice_servers
+from server.media_utils import MediaDecodeError, to_wav_bytes
 
 _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # SenseVoice 的 rich_transcription_postprocess 会在文字前后附带情绪/事件表情符号，
@@ -380,6 +381,13 @@ async def post_tts_voices(request):
         if entry is None or entry.get('module') != 'omnitts':
             return json_error(f"backend '{backend_id}' does not support voice cloning")
         server_url = (entry.get('TTS_SERVER') or getattr(opt, 'TTS_SERVER', '')).rstrip('/')
+
+        # Phones record m4a, which soundfile cannot read: normalise whatever was uploaded to a WAV
+        # before it is transcribed and before it is sent on to the voice-cloning service.
+        try:
+            audio_bytes = await asyncio.get_event_loop().run_in_executor(None, to_wav_bytes, audio_bytes)
+        except MediaDecodeError as e:
+            return json_error(f"cannot read this audio file: {e}")
 
         if not transcript:
             import io

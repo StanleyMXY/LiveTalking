@@ -85,6 +85,8 @@ CROP_ASPECT = 0.75                 # width / height = 3:4
 CROP_FACE_CENTRE_FROM_TOP = 0.35   # where the middle of the face sits in the window (fraction of its height)
 CROP_MIN_MARGIN_IN_FACES = 1.5     # a window narrower than this many face widths is not worth cutting
 CROP_SKIP_COVERAGE = 0.85          # a window covering this much of the photo: it is already framed like that
+VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'}
+VIDEO_SAMPLES = 12                 # frames looked at when the source is a video
 MAX_STORED_JOBS = 50
 JOB_KEEP_SECONDS = 3600
 
@@ -314,6 +316,34 @@ def has_face(img):
     return find_face(img) is not None
 
 
+def best_frame_from_video(video_path, face_finder=find_face, samples=VIDEO_SAMPLES):
+    """The frame of the video to make the standard image from: of `samples` frames spread evenly over the
+    video, the one in which the detected face is the largest (closest to the camera, so the most detail).
+    Raises StandardImageError when the video cannot be read or no sampled frame has a face."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if not cap.isOpened() or count < 1:
+            raise StandardImageError("This file cannot be read as a video.", BAD_PHOTO)
+        best, best_area = None, 0
+        for index in sorted({min(count - 1, int(count * (i + 0.5) / samples)) for i in range(samples)}):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            box = face_finder(frame)
+            if box is None:
+                continue
+            area = max(box[2] - box[0], 0) * max(box[3] - box[1], 0)
+            if area > best_area:
+                best, best_area = frame, area
+    finally:
+        cap.release()
+    if best is None:
+        raise StandardImageError("No face was found in the video; use a video in which the face is clearly visible.", NO_FACE)
+    return best
+
+
 # ---------------------------------------------------------------------------------------------------
 # generation
 # ---------------------------------------------------------------------------------------------------
@@ -374,9 +404,18 @@ class StandardImageJobs:
             return dict(job) if job else None
 
     def _run(self, job, photo_path):
+        frame_path = None
         try:
             editor = self.editor_factory()
-            png = generate_standard_image(photo_path, editor, self.face_finder, self.max_attempts,
+            source = photo_path
+            if os.path.splitext(photo_path)[1].lower() in VIDEO_EXTS:
+                # a video is reduced to its best frame first, then goes the way a photo does
+                frame = best_frame_from_video(photo_path, self.face_finder)
+                frame_path = photo_path + ".frame.png"
+                if not cv2.imwrite(frame_path, frame):
+                    raise StandardImageError("A frame of the video could not be saved.", BAD_PHOTO)
+                source = frame_path
+            png = generate_standard_image(source, editor, self.face_finder, self.max_attempts,
                                           on_attempt=lambda n: job.update(attempt=n))
             path = os.path.join(self.directory, f"standard_{job['job_id']}.png")
             with open(path, "wb") as f:
@@ -388,10 +427,12 @@ class StandardImageJobs:
             logger.exception("standard image job failed:")
             job.update(status="failed", error=f"Unexpected error ({type(e).__name__}).", error_code=GENERATION_FAILED)
         finally:
-            try:
-                os.remove(photo_path)   # the uploaded photo is not kept after the attempt
-            except OSError:
-                pass
+            for leftover in (photo_path, frame_path):   # the upload is not kept after the attempt
+                if leftover:
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
 
     def _forget_old(self):
         now = time.time()

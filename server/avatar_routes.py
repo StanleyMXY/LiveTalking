@@ -5,7 +5,7 @@ import uuid
 from aiohttp import web
 from server.task_manager import task_manager
 from server.media_utils import limit_image_side
-from server.standard_image import StandardImageJobs, editor_from_environment
+from server.standard_image import VIDEO_EXTS, StandardImageJobs, editor_from_environment
 from utils.logger import logger
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -189,8 +189,9 @@ def _job_or_error(request):
 
 async def create_standard_image(request):
     """
-    POST /api/avatar/standard (multipart, field `photo`): start generating the standard image of a photo.
-    The page shows the result and the user decides (POST .../use), as in the product.
+    POST /api/avatar/standard (multipart, field `photo`): start generating the standard image of a photo, or
+    of the best frame of a video. The page shows the result and the user decides (POST .../use), as in the
+    product.
     """
     try:
         if request.content_type != 'multipart/form-data':
@@ -204,8 +205,8 @@ async def create_standard_image(request):
             if part.name != 'photo':
                 continue
             ext = os.path.splitext(part.filename or '')[1].lower()
-            if ext not in IMAGE_EXTS:
-                return json_error("The photo must be a jpg, png, bmp or webp image")
+            if ext not in IMAGE_EXTS and ext not in VIDEO_EXTS:
+                return json_error("The file must be a jpg, png, bmp or webp image, or an mp4, mov, avi, mkv or webm video")
             directory = os.path.abspath('./data/tmp')
             os.makedirs(directory, exist_ok=True)
             photo_path = os.path.join(directory, f"photo_{uuid.uuid4().hex}{ext}")

@@ -63,6 +63,45 @@ class ToWavBytesTest(unittest.TestCase):
             media_utils._ffmpeg_exe = original
 
 
+class LimitReferenceAudioTest(unittest.TestCase):
+    def speech_with_pause(self, seconds, pause_at, rate=16000):
+        """A tone that is silent for 0.2 s starting at `pause_at`."""
+        t = np.arange(int(seconds * rate)) / rate
+        sig = (0.3 * np.sin(2 * np.pi * 220 * t)).astype('float32')
+        sig[int(pause_at * rate):int((pause_at + 0.2) * rate)] = 0
+        buf = io.BytesIO()
+        sf.write(buf, sig, rate, format='WAV')
+        return buf.getvalue()
+
+    def test_short_audio_is_returned_untouched(self):
+        wav = tone_wav_bytes(5.0)
+        out, cut = media_utils.limit_reference_audio(wav)
+        self.assertIs(out, wav)
+        self.assertFalse(cut)
+
+    def test_audio_of_exactly_the_limit_is_not_cut(self):
+        _, cut = media_utils.limit_reference_audio(tone_wav_bytes(29.5), 29.5)
+        self.assertFalse(cut)
+
+    def test_a_34_second_recording_is_cut_below_the_limit_at_the_pause(self):
+        out, cut = media_utils.limit_reference_audio(self.speech_with_pause(34.7, pause_at=28.0))
+        self.assertTrue(cut)
+        data, rate = sf.read(io.BytesIO(out))
+        self.assertEqual(rate, 16000)
+        self.assertLessEqual(len(data) / rate, media_utils.MAX_REFERENCE_SECONDS)
+        self.assertAlmostEqual(len(data) / rate, 28.1, delta=0.15)   # inside the pause, not mid-tone
+
+    def test_stereo_is_kept_stereo(self):
+        rate = 8000
+        buf = io.BytesIO()
+        sf.write(buf, np.full((35 * rate, 2), 0.1, 'float32'), rate, format='WAV')
+        out, cut = media_utils.limit_reference_audio(buf.getvalue())
+        data, _ = sf.read(io.BytesIO(out))
+        self.assertTrue(cut)
+        self.assertEqual(data.shape[1], 2)
+        self.assertLessEqual(len(data) / rate, media_utils.MAX_REFERENCE_SECONDS)
+
+
 class LimitImageSideTest(unittest.TestCase):
     def write_image(self, tmp, name, w, h):
         import cv2

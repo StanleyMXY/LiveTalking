@@ -8,7 +8,14 @@ import shutil
 import subprocess
 import tempfile
 
+import numpy as np
 import soundfile as sf
+
+# CosyVoice accepts a reference of at most 30 s (the product's voice sample rule is 1-30 s as well); the
+# demo cuts a longer one just below that.
+MAX_REFERENCE_SECONDS = 29.5
+CUT_SEARCH_SECONDS = 3.0
+CUT_FRAME_SECONDS = 0.05
 
 # The working avatars are 576x768 frames. A larger photo only makes the "paste the face back onto the
 # photo" step of SadTalker slower (measured on the DGX Spark: a 2690x1136 photo needed 5.1 s per frame,
@@ -63,6 +70,30 @@ def to_wav_bytes(data: bytes) -> bytes:
             raise MediaDecodeError(f"not a readable audio file ({detail[0][:160]})")
         with open(dst, 'rb') as f:
             return f.read()
+
+
+def limit_reference_audio(wav: bytes, max_seconds: float = MAX_REFERENCE_SECONDS):
+    """(wav bytes, was_cut) with the reference audio cut to at most `max_seconds`.
+
+    CosyVoice refuses a reference longer than 30 s, so a longer recording is cut instead of rejected. The
+    cut is made at the quietest moment of the last CUT_SEARCH_SECONDS before the limit, so it does not fall
+    in the middle of a word. The result is a 16 bit WAV with the original sample rate and channels.
+    """
+    data, rate = sf.read(io.BytesIO(wav), dtype='float32')
+    limit = int(max_seconds * rate)
+    if len(data) <= limit:
+        return wav, False
+    mono = data if data.ndim == 1 else data.mean(axis=1)
+    frame = max(1, int(CUT_FRAME_SECONDS * rate))
+    start = max(0, limit - int(CUT_SEARCH_SECONDS * rate))
+    cut, quietest = limit, None
+    for pos in range(start, limit - frame + 1, frame):
+        energy = float(np.square(mono[pos:pos + frame]).mean())
+        if quietest is None or energy < quietest:
+            quietest, cut = energy, pos + frame // 2
+    out = io.BytesIO()
+    sf.write(out, data[:cut], rate, format='WAV', subtype='PCM_16')
+    return out.getvalue(), True
 
 
 def limit_image_side(path: str, max_side: int = MAX_AVATAR_IMAGE_SIDE) -> str:

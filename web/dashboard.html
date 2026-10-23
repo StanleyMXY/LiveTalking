@@ -420,7 +420,7 @@
                                         <button type="submit" class="btn btn-outline-primary btn-sm w-100">生成形象</button>
                                     </div>
                                 </form>
-                                <div class="form-text mb-1">上传<b>照片</b>：先生成一张干净的标准形象图（正脸、半身），你确认后才建成形象；上传<b>视频</b>：直接用视频建成形象。</div>
+                                <div class="form-text mb-1">上传<b>照片</b>或<b>视频</b>：先生成一张干净的标准形象图（正脸、半身、固定背景），你确认后才建成形象。视频会自动选出人脸最清楚的一帧，视频里的动作和背景不会保留。</div>
                                 <div id="avatar-task-status" class="form-text"></div>
                                 <div id="standard-preview" class="mt-2" style="display:none">
                                     <img id="standard-preview-img" alt="标准形象图" style="max-width:100%; max-height:360px; border-radius:8px; border:1px solid #dee2e6">
@@ -762,7 +762,8 @@
                     return res.json();
                 }).then(function(res) {
                     if (res.code === 0) {
-                        $('#voice-clone-status').text('克隆成功: ' + name);
+                        const cut = res.data && res.data.truncated;
+                        $('#voice-clone-status').text('克隆成功: ' + name + (cut ? '（音频超过 30 秒，已自动截取前 30 秒左右，文字稿已按截取后的音频重新转写）' : ''));
                         loadVoicesForBackend(backend);
                     } else {
                         $('#voice-clone-status').text('失败: ' + res.msg);
@@ -803,7 +804,6 @@
             // ===== 照片：先生成标准形象图，用户确认后再建形象（流程同产品）；视频：直接建形象 =====
             let standardJobId = null;
             let standardPollTimer = null;
-            const IMAGE_NAME_RE = /\.(jpe?g|png|bmp|webp)$/i;
 
             function setAvatarStatus(text) { $('#avatar-task-status').text(text); }
 
@@ -818,7 +818,7 @@
                 hideStandardPreview();
                 const formData = new FormData();
                 formData.append('photo', file);
-                setAvatarStatus('上传照片中...');
+                setAvatarStatus('上传中...');
                 fetch('/api/avatar/standard', { method: 'POST', body: formData }).then(function(res) {
                     return res.json();
                 }).then(function(res) {
@@ -858,7 +858,7 @@
 
             $('#standard-retry').on('click', function() {
                 const files = document.getElementById('avatar-upload-file').files;
-                if (!files.length) { setAvatarStatus('请重新选择照片。'); return; }
+                if (!files.length) { setAvatarStatus('请重新选择照片或视频。'); return; }
                 startStandardImage(files[0]);
             });
 
@@ -894,29 +894,7 @@
                     return;
                 }
                 const file = fileInput.files[0];
-                if (IMAGE_NAME_RE.test(file.name)) {
-                    startStandardImage(file);
-                    return;
-                }
-                hideStandardPreview();
-                const formData = new FormData();
-                formData.append('video_file', file);
-                formData.append('model', 'wav2lip');
-                formData.append('avatar_id', avatarId);
-
-                setAvatarStatus('上传中...');
-                fetch('/api/avatar/task', { method: 'POST', body: formData }).then(function(res) {
-                    return res.json();
-                }).then(function(res) {
-                    if (res.code === 0) {
-                        setAvatarStatus('任务已提交: ' + res.data.task_id);
-                        pollAvatarTask(res.data.task_id);
-                    } else {
-                        setAvatarStatus('提交失败: ' + res.msg);
-                    }
-                }).catch(function(err) {
-                    setAvatarStatus('请求失败: ' + err);
-                });
+                startStandardImage(file);   // 照片和视频走同一条流程（视频先选出人脸最清楚的一帧）
             });
 
             // 识别到的文本统一走这里发送，供本地 ASR / 浏览器 ASR 共用

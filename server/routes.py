@@ -11,7 +11,7 @@ from aiohttp import web
 
 from utils.logger import logger
 from server.ice import get_ice_servers
-from server.media_utils import MediaDecodeError, to_wav_bytes
+from server.media_utils import MediaDecodeError, limit_reference_audio, to_wav_bytes
 
 _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # SenseVoice 的 rich_transcription_postprocess 会在文字前后附带情绪/事件表情符号，
@@ -389,6 +389,12 @@ async def post_tts_voices(request):
         except MediaDecodeError as e:
             return json_error(f"cannot read this audio file: {e}")
 
+        # A reference longer than 30 s is refused by the voice-cloning service: cut it, and transcribe the
+        # part that is kept (a transcript the user typed for the whole recording no longer matches it).
+        audio_bytes, was_cut = await asyncio.get_event_loop().run_in_executor(None, limit_reference_audio, audio_bytes)
+        if was_cut:
+            transcript = ''
+
         if not transcript:
             import io
             import soundfile as sf
@@ -415,7 +421,10 @@ async def post_tts_voices(request):
         if res.status_code != 200:
             return json_error(f"voice registration failed: {res.text}")
 
-        return json_ok(data=res.json())
+        result = res.json()
+        if isinstance(result, dict):
+            result['truncated'] = was_cut
+        return json_ok(data=result)
     except Exception as e:
         logger.exception('post_tts_voices exception:')
         return json_error(str(e))

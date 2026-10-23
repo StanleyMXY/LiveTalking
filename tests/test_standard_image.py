@@ -212,6 +212,66 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(editor.edit.call_count, 3)
 
 
+def write_video(path, sizes, size=(160, 120)):
+    """A video whose frame i is filled with the value i; `sizes` is only its length."""
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'MJPG'), 10, size)
+    for i in range(sizes):
+        writer.write(np.full((size[1], size[0], 3), i * 4, np.uint8))
+    writer.release()
+    return path
+
+
+class VideoFrameTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.video = write_video(os.path.join(self.tmp.name, "v.avi"), 60)
+
+    def test_picks_the_frame_with_the_largest_face(self):
+        def finder(frame):
+            value = int(frame.mean())            # the frame's own number (x4), up to JPEG noise
+            return (0, 0, 80, 80) if abs(value - 28 * 4) < 8 else (0, 0, 20, 20)
+        frame = standard_image.best_frame_from_video(self.video, finder, samples=12)
+        self.assertLess(abs(int(frame.mean()) - 28 * 4), 8)
+
+    def test_frames_without_a_face_are_skipped(self):
+        seen = []
+        def finder(frame):
+            seen.append(1)
+            return (0, 0, 30, 30) if len(seen) == 5 else None
+        standard_image.best_frame_from_video(self.video, finder, samples=12)
+        self.assertEqual(len(seen), 12)
+
+    def test_a_video_without_any_face_is_refused(self):
+        with self.assertRaises(StandardImageError) as ctx:
+            standard_image.best_frame_from_video(self.video, lambda frame: None)
+        self.assertEqual(ctx.exception.code, NO_FACE)
+
+    def test_a_file_that_is_not_a_video_is_refused(self):
+        bad = os.path.join(self.tmp.name, "bad.mp4")
+        with open(bad, "wb") as f:
+            f.write(b"not a video")
+        with self.assertRaises(StandardImageError) as ctx:
+            standard_image.best_frame_from_video(bad, lambda frame: (0, 0, 10, 10))
+        self.assertEqual(ctx.exception.code, BAD_PHOTO)
+
+    def test_a_job_made_from_a_video_ends_with_a_standard_image_and_keeps_no_upload(self):
+        editor = MagicMock()
+        editor.edit.return_value = (np.random.rand(64, 64, 3) * 255).astype('uint8')
+        jobs = StandardImageJobs(self.tmp.name, lambda: editor, face_finder=lambda img: (10, 10, 40, 40))
+        upload = os.path.join(self.tmp.name, "up.avi")
+        os.replace(self.video, upload)
+        job_id = jobs.start(upload)
+        end = time.time() + 10
+        while jobs.get(job_id)["status"] == "running" and time.time() < end:
+            time.sleep(0.02)
+        job = jobs.get(job_id)
+        self.assertEqual(job["status"], "done", job["error"])
+        self.assertFalse(os.path.exists(upload))
+        self.assertFalse(os.path.exists(upload + ".frame.png"))
+        editor.edit.assert_called_once()
+
+
 class JobsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -312,9 +372,20 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         early = await (await self.client.post(f"/api/avatar/standard/{job_id}/use", json={"avatar_id": "ok"})).json()
         self.assertIn("not ready", early["msg"])
 
+    async def test_a_video_upload_is_accepted(self):
+        path = write_video(os.path.join(self.tmp.name, "clip.avi"), 30)
+        form = FormData()
+        form.add_field("photo", open(path, "rb").read(), filename="clip.mp4", content_type="video/mp4")
+        body = await (await self.client.post("/api/avatar/standard", data=form)).json()
+        self.assertEqual(body["code"], 0)
+        # the bytes are an avi under an mp4 name; OpenCV reads by content, the job must still end
+        status = await self.finish(body["data"]["job_id"])
+        self.assertIn(status["status"], ("done", "failed"))
+
     async def test_non_image_upload_and_unknown_job(self):
         bad = await (await self.client.post("/api/avatar/standard", data=self.upload("note.txt", b"text"))).json()
         self.assertEqual(bad["code"], -1)
+        self.assertIn("video", bad["msg"])
         for url in ("/api/avatar/standard/" + "0" * 32, "/api/avatar/standard/not-a-job", "/api/avatar/standard/" + "0" * 32 + "/image"):
             self.assertEqual((await (await self.client.get(url)).json())["code"], 404)
 

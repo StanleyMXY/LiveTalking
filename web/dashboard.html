@@ -420,7 +420,15 @@
                                         <button type="submit" class="btn btn-outline-primary btn-sm w-100">生成形象</button>
                                     </div>
                                 </form>
+                                <div class="form-text mb-1">上传<b>照片</b>：先生成一张干净的标准形象图（正脸、半身），你确认后才建成形象；上传<b>视频</b>：直接用视频建成形象。</div>
                                 <div id="avatar-task-status" class="form-text"></div>
+                                <div id="standard-preview" class="mt-2" style="display:none">
+                                    <img id="standard-preview-img" alt="标准形象图" style="max-width:100%; max-height:360px; border-radius:8px; border:1px solid #dee2e6">
+                                    <div class="mt-2">
+                                        <button type="button" class="btn btn-primary btn-sm" id="standard-use">使用这个形象</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="standard-retry">重新生成</button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -792,31 +800,122 @@
                 }, 2000);
             }
 
+            // ===== 照片：先生成标准形象图，用户确认后再建形象（流程同产品）；视频：直接建形象 =====
+            let standardJobId = null;
+            let standardPollTimer = null;
+            const IMAGE_NAME_RE = /\.(jpe?g|png|bmp|webp)$/i;
+
+            function setAvatarStatus(text) { $('#avatar-task-status').text(text); }
+
+            function hideStandardPreview() {
+                if (standardPollTimer) { clearInterval(standardPollTimer); standardPollTimer = null; }
+                standardJobId = null;
+                $('#standard-preview').hide();
+                $('#standard-preview-img').removeAttr('src');
+            }
+
+            function startStandardImage(file) {
+                hideStandardPreview();
+                const formData = new FormData();
+                formData.append('photo', file);
+                setAvatarStatus('上传照片中...');
+                fetch('/api/avatar/standard', { method: 'POST', body: formData }).then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    if (res.code !== 0) { setAvatarStatus('提交失败: ' + res.msg); return; }
+                    standardJobId = res.data.job_id;
+                    pollStandardImage(standardJobId);
+                }).catch(function(err) {
+                    setAvatarStatus('请求失败: ' + err);
+                });
+            }
+
+            function pollStandardImage(jobId) {
+                if (standardPollTimer) clearInterval(standardPollTimer);
+                standardPollTimer = setInterval(function() {
+                    fetch('/api/avatar/standard/' + jobId).then(function(res) {
+                        return res.json();
+                    }).then(function(res) {
+                        if (jobId !== standardJobId) return;   // 已经换了一张照片
+                        if (res.code !== 0) { setAvatarStatus('查询失败: ' + res.msg); clearInterval(standardPollTimer); return; }
+                        const job = res.data;
+                        if (job.status === 'running') {
+                            setAvatarStatus('正在生成标准形象图（第 ' + Math.max(job.attempt, 1) + '/' + job.max_attempts + ' 次尝试，通常半分钟到两分钟）...');
+                        } else if (job.status === 'done') {
+                            clearInterval(standardPollTimer);
+                            setAvatarStatus('标准形象图已生成，请看一下效果：满意就点"使用这个形象"，不满意可以重新生成。');
+                            $('#standard-preview-img').attr('src', '/api/avatar/standard/' + jobId + '/image?t=' + Date.now());
+                            $('#standard-preview').show();
+                        } else {
+                            clearInterval(standardPollTimer);
+                            setAvatarStatus('生成失败: ' + job.error);
+                        }
+                    }).catch(function(err) {
+                        console.error('轮询标准形象图失败:', err);
+                    });
+                }, 2000);
+            }
+
+            $('#standard-retry').on('click', function() {
+                const files = document.getElementById('avatar-upload-file').files;
+                if (!files.length) { setAvatarStatus('请重新选择照片。'); return; }
+                startStandardImage(files[0]);
+            });
+
+            $('#standard-use').on('click', function() {
+                const avatarId = $('#avatar-upload-id').val().trim();
+                if (!standardJobId || !avatarId) { setAvatarStatus('请先填写形象名字。'); return; }
+                const jobId = standardJobId;
+                setAvatarStatus('提交中...');
+                fetch('/api/avatar/standard/' + jobId + '/use', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ avatar_id: avatarId })
+                }).then(function(res) {
+                    return res.json();
+                }).then(function(res) {
+                    if (res.code === 0) {
+                        hideStandardPreview();
+                        setAvatarStatus('任务已提交: ' + res.data.task_id);
+                        pollAvatarTask(res.data.task_id);
+                    } else {
+                        setAvatarStatus('提交失败: ' + res.msg);
+                    }
+                }).catch(function(err) {
+                    setAvatarStatus('请求失败: ' + err);
+                });
+            });
+
             $('#avatar-upload-form').on('submit', function(e) {
                 e.preventDefault();
                 const fileInput = document.getElementById('avatar-upload-file');
                 const avatarId = $('#avatar-upload-id').val().trim();
                 if (!fileInput.files.length || !avatarId) {
-                    $('#avatar-task-status').text('请先选择视频/图片文件并填写形象名字。');
+                    setAvatarStatus('请先选择视频/图片文件并填写形象名字。');
                     return;
                 }
+                const file = fileInput.files[0];
+                if (IMAGE_NAME_RE.test(file.name)) {
+                    startStandardImage(file);
+                    return;
+                }
+                hideStandardPreview();
                 const formData = new FormData();
-                formData.append('video_file', fileInput.files[0]);
+                formData.append('video_file', file);
                 formData.append('model', 'wav2lip');
                 formData.append('avatar_id', avatarId);
 
-                $('#avatar-task-status').text('上传中...');
+                setAvatarStatus('上传中...');
                 fetch('/api/avatar/task', { method: 'POST', body: formData }).then(function(res) {
                     return res.json();
                 }).then(function(res) {
                     if (res.code === 0) {
-                        $('#avatar-task-status').text('任务已提交: ' + res.data.task_id);
+                        setAvatarStatus('任务已提交: ' + res.data.task_id);
                         pollAvatarTask(res.data.task_id);
                     } else {
-                        $('#avatar-task-status').text('提交失败: ' + res.msg);
+                        setAvatarStatus('提交失败: ' + res.msg);
                     }
                 }).catch(function(err) {
-                    $('#avatar-task-status').text('请求失败: ' + err);
+                    setAvatarStatus('请求失败: ' + err);
                 });
             });
 

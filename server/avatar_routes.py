@@ -5,6 +5,7 @@ import uuid
 from aiohttp import web
 from server.task_manager import task_manager
 from server.media_utils import limit_image_side
+from server.standard_image import StandardImageJobs, editor_from_environment
 from utils.logger import logger
 
 _SAFE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -78,6 +79,28 @@ def animate_image_with_sadtalker(image_path: str, progress_callback=None) -> str
     return out_path
 
 
+def _build_task_params(params, video_path, save_path):
+    """The parameters of an avatar-creation task from the request's fields (defaults as before)."""
+    task_params = {
+        "video_path": video_path,
+        "save_path": save_path,
+        "img_size": int(params.get('img_size', 256)),
+        "nosmooth": params.get('nosmooth', 'false').lower() == 'true' if isinstance(params.get('nosmooth'), str) else params.get('nosmooth', False),
+        "bbox_shift": int(params.get('bbox_shift', 0)),
+        "extra_margin": int(params.get('extra_margin', 10)),
+        "parsing_mode": params.get('parsing_mode', 'jaw'),
+        "version": params.get('version', 'v15'),
+        "face_det_batch_size": int(params.get('face_det_batch_size', 16))
+    }
+
+    pads_str = params.get('pads', "0 10 0 0")
+    if isinstance(pads_str, str):
+        task_params['pads'] = [int(x) for x in pads_str.split()]
+    else:
+        task_params['pads'] = pads_str
+    return task_params
+
+
 async def create_avatar_task(request):
     """
     POST /api/avatar/task
@@ -133,23 +156,7 @@ async def create_avatar_task(request):
 
         save_path = data_path
 
-        task_params = {
-            "video_path": video_path,
-            "save_path": save_path,
-            "img_size": int(params.get('img_size', 256)),
-            "nosmooth": params.get('nosmooth', 'false').lower() == 'true' if isinstance(params.get('nosmooth'), str) else params.get('nosmooth', False),
-            "bbox_shift": int(params.get('bbox_shift', 0)),
-            "extra_margin": int(params.get('extra_margin', 10)),
-            "parsing_mode": params.get('parsing_mode', 'jaw'),
-            "version": params.get('version', 'v15'),
-            "face_det_batch_size": int(params.get('face_det_batch_size', 16))
-        }
-
-        pads_str = params.get('pads', "0 10 0 0")
-        if isinstance(pads_str, str):
-            task_params['pads'] = [int(x) for x in pads_str.split()]
-        else:
-            task_params['pads'] = pads_str
+        task_params = _build_task_params(params, video_path, save_path)
 
         task_id_input = params.get('task_id')
         notify_url = params.get('notifyurl')
@@ -160,6 +167,102 @@ async def create_avatar_task(request):
     except Exception as e:
         logger.exception("create_avatar_task error:")
         return json_error(str(e))
+
+_JOB_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+_standard_jobs = None
+
+
+def _jobs():
+    global _standard_jobs
+    if _standard_jobs is None:
+        directory = os.path.abspath('./data/tmp')
+        os.makedirs(directory, exist_ok=True)
+        _standard_jobs = StandardImageJobs(directory, editor_from_environment)
+    return _standard_jobs
+
+
+def _job_or_error(request):
+    job_id = request.match_info.get('job_id', '')
+    job = _jobs().get(job_id) if _JOB_ID_RE.match(job_id) else None
+    return job, (None if job else json_error("Job not found", code=404))
+
+
+async def create_standard_image(request):
+    """
+    POST /api/avatar/standard (multipart, field `photo`): start generating the standard image of a photo.
+    The page shows the result and the user decides (POST .../use), as in the product.
+    """
+    try:
+        if request.content_type != 'multipart/form-data':
+            return json_error("multipart/form-data with a `photo` field is required")
+        reader = await request.multipart()
+        photo_path = None
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name != 'photo':
+                continue
+            ext = os.path.splitext(part.filename or '')[1].lower()
+            if ext not in IMAGE_EXTS:
+                return json_error("The photo must be a jpg, png, bmp or webp image")
+            directory = os.path.abspath('./data/tmp')
+            os.makedirs(directory, exist_ok=True)
+            photo_path = os.path.join(directory, f"photo_{uuid.uuid4().hex}{ext}")
+            with open(photo_path, 'wb') as f:
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if photo_path is None:
+            return json_error("photo is required")
+        return json_ok(data={"job_id": _jobs().start(photo_path)})
+    except Exception as e:
+        logger.exception("create_standard_image error:")
+        return json_error(str(e))
+
+
+async def get_standard_image_status(request):
+    """GET /api/avatar/standard/{job_id}"""
+    job, error = _job_or_error(request)
+    if error:
+        return error
+    return json_ok(data={k: job[k] for k in ("job_id", "status", "attempt", "max_attempts", "error", "error_code")})
+
+
+async def get_standard_image(request):
+    """GET /api/avatar/standard/{job_id}/image: the generated image, for the preview."""
+    job, error = _job_or_error(request)
+    if error:
+        return error
+    if job["status"] != "done" or not job["path"] or not os.path.isfile(job["path"]):
+        return json_error("The image is not ready", code=404)
+    return web.FileResponse(job["path"], headers={"Cache-Control": "no-store"})
+
+
+async def use_standard_image(request):
+    """
+    POST /api/avatar/standard/{job_id}/use  {avatar_id}: the user accepted the standard image; create the
+    avatar from it (the same task as for an uploaded file).
+    """
+    try:
+        job, error = _job_or_error(request)
+        if error:
+            return error
+        params = await request.json()
+        avatar_id = params.get('avatar_id')
+        if not avatar_id or not _SAFE_ID_RE.match(avatar_id):
+            return json_error("avatar_id must match ^[A-Za-z0-9_-]{1,64}$")
+        if job["status"] != "done" or not job["path"] or not os.path.isfile(job["path"]):
+            return json_error("The image is not ready")
+        task_params = _build_task_params({}, job["path"], './data/avatars')
+        task_id = task_manager.add_task('wav2lip', avatar_id, task_params)
+        return json_ok(data={"task_id": task_id})
+    except Exception as e:
+        logger.exception("use_standard_image error:")
+        return json_error(str(e))
+
 
 async def get_avatar_task_status(request):
     """
@@ -207,6 +310,10 @@ async def list_avatars(request):
 
 
 def setup_avatar_routes(app):
+    app.router.add_post("/api/avatar/standard", create_standard_image)
+    app.router.add_get("/api/avatar/standard/{job_id}", get_standard_image_status)
+    app.router.add_get("/api/avatar/standard/{job_id}/image", get_standard_image)
+    app.router.add_post("/api/avatar/standard/{job_id}/use", use_standard_image)
     app.router.add_post("/api/avatar/task", create_avatar_task)
     app.router.add_get("/api/avatar/task/{task_id}", get_avatar_task_status)
     app.router.add_delete("/api/avatar/task/{task_id}", delete_avatar_task)

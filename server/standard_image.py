@@ -79,6 +79,12 @@ SEED_MAX = 2_147_483_647
 
 MAX_ATTEMPTS = 3
 FACE_CHECK_MAX_SIDE = 1024
+# the head-and-shoulders window cut around the face before generating
+CROP_WIDTH_IN_FACES = 3.2          # window width in face widths
+CROP_ASPECT = 0.75                 # width / height = 3:4
+CROP_FACE_CENTRE_FROM_TOP = 0.35   # where the middle of the face sits in the window (fraction of its height)
+CROP_MIN_MARGIN_IN_FACES = 1.5     # a window narrower than this many face widths is not worth cutting
+CROP_SKIP_COVERAGE = 0.85          # a window covering this much of the photo: it is already framed like that
 MAX_STORED_JOBS = 50
 JOB_KEEP_SECONDS = 3600
 
@@ -255,34 +261,73 @@ _detector = None
 _detector_lock = threading.Lock()
 
 
-def has_face(img):
-    """True if the project's face detector (the one avatar creation uses) finds a face in the image."""
+def find_face(img):
+    """(x1, y1, x2, y2) of the face the project's detector (the one avatar creation uses) finds, in the
+    coordinates of `img`, or None."""
     global _detector
     h, w = img.shape[:2]
+    scale = 1.0
+    small = img
     if max(h, w) > FACE_CHECK_MAX_SIDE:
-        s = FACE_CHECK_MAX_SIDE / max(h, w)
-        img = cv2.resize(img, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+        scale = FACE_CHECK_MAX_SIDE / max(h, w)
+        small = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
     with _detector_lock:
         if _detector is None:
             import torch
             from avatars.wav2lip import face_detection
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             _detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False, device=device)
-        return _detector.get_detections_for_batch(np.array([img]))[0] is not None
+        box = _detector.get_detections_for_batch(np.array([small]))[0]
+    if box is None:
+        return None
+    return tuple(int(round(v / scale)) for v in box)
+
+
+def crop_around_face(img, box):
+    """The head-and-shoulders part of the photo, 3:4, around the face box.
+
+    The model keeps the proportions of what it is given, so a phone screenshot (status bar, black bars, a
+    small face in a tall frame) would come back as a very narrow portrait with a small face. The window is
+    CROP_WIDTH_IN_FACES face widths wide, 3:4, the middle of the face a little above the middle of the
+    window, moved inside the photo when it sticks out. A photo that is already framed about like that (the
+    window would cover most of it), and one where the window would not even leave a margin around the face,
+    is returned unchanged.
+    """
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+    face_w = max(x2 - x1, 1)
+    crop_w = face_w * CROP_WIDTH_IN_FACES
+    crop_h = crop_w / CROP_ASPECT
+    shrink = min(1.0, w / crop_w, h / crop_h)
+    crop_w, crop_h = crop_w * shrink, crop_h * shrink
+    if crop_w < face_w * CROP_MIN_MARGIN_IN_FACES:
+        return img
+    if crop_w * crop_h >= CROP_SKIP_COVERAGE * w * h:
+        return img
+    left = min(max((x1 + x2) / 2 - crop_w / 2, 0), w - crop_w)
+    top = min(max((y1 + y2) / 2 - CROP_FACE_CENTRE_FROM_TOP * crop_h, 0), h - crop_h)
+    left, top = int(round(left)), int(round(top))
+    return img[top:top + int(round(crop_h)), left:left + int(round(crop_w))].copy()
+
+
+def has_face(img):
+    return find_face(img) is not None
 
 
 # ---------------------------------------------------------------------------------------------------
 # generation
 # ---------------------------------------------------------------------------------------------------
-def generate_standard_image(photo_path, editor, face_check=has_face, max_attempts=MAX_ATTEMPTS,
+def generate_standard_image(photo_path, editor, face_finder=find_face, max_attempts=MAX_ATTEMPTS,
                             outfit=DEFAULT_OUTFIT, background=DEFAULT_BACKGROUND, on_attempt=None):
     """PNG bytes of the standard image generated from the photo. Raises StandardImageError."""
     photo = cv2.imread(photo_path)
     if photo is None:
         raise StandardImageError("This file cannot be read as an image.", BAD_PHOTO)
     # Early, free rejection: generating costs money and needs a face (design 3.1)
-    if not face_check(photo):
+    box = face_finder(photo)
+    if box is None:
         raise StandardImageError("No face was found in the photo; use a photo with a clearly visible face.", NO_FACE)
+    photo = crop_around_face(photo, box)
 
     data_uri, width, height = fit_for_edit(photo)
     prompt = build_prompt(outfit, background)
@@ -291,7 +336,7 @@ def generate_standard_image(photo_path, editor, face_check=has_face, max_attempt
             on_attempt(attempt)
         # random seed per attempt: without one the service answers the same input with the same image
         edited = editor.edit(data_uri, width, height, prompt, NEGATIVE_PROMPT, secrets.randbelow(SEED_MAX + 1))
-        if face_check(edited):
+        if face_finder(edited) is not None:
             ok, png = cv2.imencode(".png", edited)
             if ok:
                 return png.tobytes()
@@ -304,10 +349,10 @@ def generate_standard_image(photo_path, editor, face_check=has_face, max_attempt
 class StandardImageJobs:
     """Background generation: one job per uploaded photo, polled by the page."""
 
-    def __init__(self, directory, editor_factory, face_check=has_face, max_workers=2, max_attempts=MAX_ATTEMPTS):
+    def __init__(self, directory, editor_factory, face_finder=find_face, max_workers=2, max_attempts=MAX_ATTEMPTS):
         self.directory = directory
         self.editor_factory = editor_factory
-        self.face_check = face_check
+        self.face_finder = face_finder
         self.max_attempts = max_attempts
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="standard-image")
         self._jobs = {}
@@ -331,7 +376,7 @@ class StandardImageJobs:
     def _run(self, job, photo_path):
         try:
             editor = self.editor_factory()
-            png = generate_standard_image(photo_path, editor, self.face_check, self.max_attempts,
+            png = generate_standard_image(photo_path, editor, self.face_finder, self.max_attempts,
                                           on_attempt=lambda n: job.update(attempt=n))
             path = os.path.join(self.directory, f"standard_{job['job_id']}.png")
             with open(path, "wb") as f:

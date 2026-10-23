@@ -14,7 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from server import avatar_routes, standard_image
 from server.standard_image import (
     BAD_PHOTO, GENERATION_FAILED, NO_FACE, ImageEditor, StandardImageError, StandardImageJobs,
-    build_prompt, fit_for_edit, generate_standard_image, output_size,
+    build_prompt, crop_around_face, fit_for_edit, generate_standard_image, output_size,
 )
 
 
@@ -61,6 +61,49 @@ class SizeTest(unittest.TestCase):
         with self.assertRaises(StandardImageError) as ctx:
             fit_for_edit(np.zeros((3000, 200, 3), np.uint8))
         self.assertEqual(ctx.exception.code, BAD_PHOTO)
+
+
+class CropAroundFaceTest(unittest.TestCase):
+    def image(self, w, h):
+        return np.zeros((h, w, 3), np.uint8)
+
+    def test_tall_screenshot_becomes_a_3_to_4_head_and_shoulders_window(self):
+        out = crop_around_face(self.image(1136, 2690), (350, 1100, 800, 1550))   # a 450 px face in the tall frame
+        h, w = out.shape[:2]
+        self.assertAlmostEqual(w / h, 0.75, delta=0.01)
+        self.assertLess(h, 2690 * 0.7)           # the status bar area and the black bars are gone
+        self.assertLessEqual(w, 1136)
+
+    def test_the_window_contains_the_whole_face(self):
+        marked = self.image(1136, 2690)
+        marked[1100:1550, 350:800] = 255
+        win = crop_around_face(marked, (350, 1100, 800, 1550))
+        self.assertEqual(int((win == 255).all(axis=2).sum()), 450 * 450)
+
+    def test_face_near_the_edge_keeps_the_window_inside_the_photo(self):
+        marked = self.image(2000, 1500)
+        marked[50:350, 20:320] = 255            # a face at the top-left corner
+        win = crop_around_face(marked, (20, 50, 320, 350))
+        self.assertEqual(int((win == 255).all(axis=2).sum()), 300 * 300)
+        self.assertAlmostEqual(win.shape[1] / win.shape[0], 0.75, delta=0.01)
+
+    def test_photo_that_is_already_framed_like_that_is_not_cut(self):
+        img = self.image(900, 1200)
+        self.assertIs(crop_around_face(img, (300, 300, 600, 600)), img)
+
+    def test_a_face_that_fills_the_frame_is_not_cut(self):
+        img = self.image(1000, 700)
+        self.assertIs(crop_around_face(img, (200, 50, 800, 650)), img)
+
+    def test_generation_sends_the_cropped_photo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tall.jpg")
+            cv2.imwrite(path, self.image(1136, 2690) + 90)
+            editor = MagicMock()
+            editor.edit.side_effect = lambda *a: (np.random.rand(96, 96, 3) * 255).astype('uint8')
+            generate_standard_image(path, editor, face_finder=lambda img: (350, 1100, 800, 1550))
+            width, height = editor.edit.call_args.args[1:3]
+            self.assertAlmostEqual(width / height, 0.75, delta=0.01)
 
 
 class EditorTest(unittest.TestCase):
@@ -139,7 +182,7 @@ class GenerateTest(unittest.TestCase):
     def test_photo_without_a_face_is_refused_before_any_paid_call(self):
         editor = self.editor()
         with self.assertRaises(StandardImageError) as ctx:
-            generate_standard_image(self.path, editor, face_check=lambda img: False)
+            generate_standard_image(self.path, editor, face_finder=lambda img: None)
         self.assertEqual(ctx.exception.code, NO_FACE)
         editor.edit.assert_not_called()
 
@@ -147,14 +190,14 @@ class GenerateTest(unittest.TestCase):
         bad = os.path.join(self.tmp.name, "bad.jpg")
         open(bad, "wb").write(b"not an image")
         with self.assertRaises(StandardImageError) as ctx:
-            generate_standard_image(bad, self.editor(), face_check=lambda img: True)
+            generate_standard_image(bad, self.editor(), face_finder=lambda img: (10, 10, 40, 40))
         self.assertEqual(ctx.exception.code, BAD_PHOTO)
 
     def test_an_attempt_without_a_face_is_retried_with_a_new_seed(self):
         editor = self.editor()
         # photo: yes, 1st result: no face, 2nd result: face
-        answers = iter([True, False, True])
-        png = generate_standard_image(self.path, editor, face_check=lambda img: next(answers))
+        answers = iter([(10, 10, 40, 40), None, (10, 10, 40, 40)])
+        png = generate_standard_image(self.path, editor, face_finder=lambda img: next(answers))
         self.assertEqual(editor.edit.call_count, 2)
         seeds = [call.args[-1] for call in editor.edit.call_args_list]
         self.assertNotEqual(seeds[0], seeds[1])
@@ -162,9 +205,9 @@ class GenerateTest(unittest.TestCase):
 
     def test_gives_up_after_the_last_attempt(self):
         editor = self.editor()
-        answers = iter([True] + [False] * 3)
+        answers = iter([(10, 10, 40, 40)] + [None] * 3)
         with self.assertRaises(StandardImageError) as ctx:
-            generate_standard_image(self.path, editor, face_check=lambda img: next(answers), max_attempts=3)
+            generate_standard_image(self.path, editor, face_finder=lambda img: next(answers), max_attempts=3)
         self.assertEqual(ctx.exception.code, GENERATION_FAILED)
         self.assertEqual(editor.edit.call_count, 3)
 
@@ -187,7 +230,7 @@ class JobsTest(unittest.TestCase):
         upload = photo(os.path.join(self.tmp.name, "up.jpg"))
         editor = MagicMock()
         editor.edit.return_value = (np.random.rand(64, 64, 3) * 255).astype('uint8')
-        jobs = StandardImageJobs(self.tmp.name, lambda: editor, face_check=lambda img: True)
+        jobs = StandardImageJobs(self.tmp.name, lambda: editor, face_finder=lambda img: (10, 10, 40, 40))
         job = self.wait(jobs, jobs.start(upload))
         self.assertEqual(job["status"], "done")
         self.assertTrue(os.path.isfile(job["path"]))
@@ -195,7 +238,7 @@ class JobsTest(unittest.TestCase):
 
     def test_job_failure_carries_the_user_message_and_code(self):
         upload = photo(os.path.join(self.tmp.name, "up.jpg"))
-        jobs = StandardImageJobs(self.tmp.name, lambda: MagicMock(), face_check=lambda img: False)
+        jobs = StandardImageJobs(self.tmp.name, lambda: MagicMock(), face_finder=lambda img: None)
         job = self.wait(jobs, jobs.start(upload))
         self.assertEqual((job["status"], job["error_code"]), ("failed", NO_FACE))
         self.assertIn("No face", job["error"])
@@ -203,7 +246,7 @@ class JobsTest(unittest.TestCase):
     def test_missing_key_is_a_clear_failure(self):
         upload = photo(os.path.join(self.tmp.name, "up.jpg"))
         with patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
-            jobs = StandardImageJobs(self.tmp.name, standard_image.editor_from_environment, face_check=lambda img: True)
+            jobs = StandardImageJobs(self.tmp.name, standard_image.editor_from_environment, face_finder=lambda img: (10, 10, 40, 40))
             job = self.wait(jobs, jobs.start(upload))
         self.assertEqual(job["error_code"], standard_image.NOT_CONFIGURED)
 
@@ -217,7 +260,7 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         editor = MagicMock()
         editor.edit.return_value = (np.random.rand(64, 64, 3) * 255).astype('uint8')
-        self.jobs = StandardImageJobs(self.tmp.name, lambda: editor, face_check=lambda img: True)
+        self.jobs = StandardImageJobs(self.tmp.name, lambda: editor, face_finder=lambda img: (10, 10, 40, 40))
         patcher = patch.object(avatar_routes, "_standard_jobs", self.jobs)
         patcher.start()
         self.addCleanup(patcher.stop)

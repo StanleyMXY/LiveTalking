@@ -1084,7 +1084,10 @@
                 setVoiceLabel('准备麦克风…');
                 let stream;
                 try {
-                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    // 浏览器自带的降噪、回声消除、自动增益，显式打开（不是所有浏览器默认都开）
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true }
+                    });
                 } catch (err) {
                     console.error('无法访问麦克风:', err);
                     resetVoiceButton();

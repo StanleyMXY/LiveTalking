@@ -763,7 +763,7 @@
                 }).then(function(res) {
                     if (res.code === 0) {
                         const cut = res.data && res.data.truncated;
-                        $('#voice-clone-status').text('克隆成功: ' + name + (cut ? '（音频超过 30 秒，已自动截取前 30 秒左右，文字稿已按截取后的音频重新转写）' : ''));
+                        $('#voice-clone-status').text('克隆成功: ' + name + (cut ? '（参考音频只取前 10 秒左右，文字稿已按截取后的音频重新转写）' : ''));
                         loadVoicesForBackend(backend);
                     } else {
                         $('#voice-clone-status').text('失败: ' + res.msg);

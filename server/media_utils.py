@@ -11,9 +11,11 @@ import tempfile
 import numpy as np
 import soundfile as sf
 
-# CosyVoice accepts a reference of at most 30 s (the product's voice sample rule is 1-30 s as well); the
-# demo cuts a longer one just below that.
-MAX_REFERENCE_SECONDS = 29.5
+# CosyVoice refuses a reference longer than 30 s (the product's voice sample rule is 1-30 s too), and a longer
+# reference makes every sentence a little slower (measured on the Spark with the voice enrolled once: whole
+# sentence about 3.8 s with a 3.5 s reference, about 4.9 s with 15.6 s). The demo keeps the first 10 s, which
+# is enough for a full phrase or two; whether that is enough for a good likeness is not measured.
+MAX_REFERENCE_SECONDS = 10.0
 CUT_SEARCH_SECONDS = 3.0
 CUT_FRAME_SECONDS = 0.05
 

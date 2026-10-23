@@ -80,16 +80,16 @@ class LimitReferenceAudioTest(unittest.TestCase):
         self.assertFalse(cut)
 
     def test_audio_of_exactly_the_limit_is_not_cut(self):
-        _, cut = media_utils.limit_reference_audio(tone_wav_bytes(29.5), 29.5)
+        _, cut = media_utils.limit_reference_audio(tone_wav_bytes(media_utils.MAX_REFERENCE_SECONDS), media_utils.MAX_REFERENCE_SECONDS)
         self.assertFalse(cut)
 
     def test_a_34_second_recording_is_cut_below_the_limit_at_the_pause(self):
-        out, cut = media_utils.limit_reference_audio(self.speech_with_pause(34.7, pause_at=28.0))
+        out, cut = media_utils.limit_reference_audio(self.speech_with_pause(34.7, pause_at=9.0))
         self.assertTrue(cut)
         data, rate = sf.read(io.BytesIO(out))
         self.assertEqual(rate, 16000)
         self.assertLessEqual(len(data) / rate, media_utils.MAX_REFERENCE_SECONDS)
-        self.assertAlmostEqual(len(data) / rate, 28.1, delta=0.15)   # inside the pause, not mid-tone
+        self.assertAlmostEqual(len(data) / rate, 9.1, delta=0.15)   # inside the pause, not mid-tone
 
     def test_stereo_is_kept_stereo(self):
         rate = 8000
